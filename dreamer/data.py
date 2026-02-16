@@ -1,3 +1,13 @@
+"""Dreamer4 JAX 的合成数据与环境接口。
+
+本模块提供：
+- 弹跳方块视频生成（动作条件）；
+- 训练迭代器（JIT 友好）；
+- 与训练/评估脚本配套的环境 reset/step 封装。
+
+所有返回张量以批维优先，便于直接接入训练流水线。
+"""
+
 from functools import partial
 import jax
 import jax.numpy as jnp

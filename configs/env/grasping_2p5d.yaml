@@ -1,0 +1,18 @@
+env_name: grasping_2p5d
+
+stages:
+  tokenizer:
+    action_dim: 8
+    pixels_per_step: 2
+  dynamics:
+    action_dim: 8
+    pixels_per_step: 2
+  bc_rew:
+    action_dim: 8
+    n_tasks: 128
+    pixels_per_step: 2
+  policy:
+    action_dim: 8
+    n_tasks: 128
+    pixels_per_step: 2
+

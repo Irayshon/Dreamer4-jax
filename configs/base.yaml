@@ -1,0 +1,98 @@
+experiment_name: dreamer4_grasping
+output_root: runs
+env_name: grasping_2p5d
+
+tracking:
+  use_wandb: false
+
+stages:
+  tokenizer:
+    B: 8
+    T: 32
+    H: 32
+    W: 32
+    C: 3
+    patch: 4
+    max_steps: 3000
+    log_every: 100
+    lr: 0.0001
+    lpips_weight: 0.2
+    lpips_frac: 0.25
+    ckpt_save_every: 1000
+    ckpt_max_to_keep: 5
+    write_image_every: 1000
+    pixels_per_step: 2
+    size_min: 6
+    size_max: 14
+    hold_min: 4
+    hold_max: 9
+    diversify_data: true
+
+  dynamics:
+    B: 8
+    T: 32
+    H: 32
+    W: 32
+    C: 3
+    patch: 4
+    action_dim: 8
+    max_steps: 5000
+    log_every: 200
+    lr: 0.0003
+    bootstrap_start: 500
+    self_fraction: 0.25
+    write_video_every: 0
+    ckpt_save_every: 2000
+    ckpt_max_to_keep: 3
+    pixels_per_step: 2
+
+  bc_rew:
+    B: 8
+    T: 32
+    H: 32
+    W: 32
+    C: 3
+    patch: 4
+    action_dim: 8
+    n_tasks: 128
+    L: 2
+    max_steps: 5000
+    log_every: 200
+    lr: 0.0003
+    bootstrap_start: 500
+    self_fraction: 0.25
+    write_video_every: 0
+    ckpt_save_every: 2000
+    ckpt_max_to_keep: 3
+    loss_weight_shortcut: 1.0
+    loss_weight_policy: 1.0
+    loss_weight_reward: 1.0
+    pixels_per_step: 2
+
+  policy:
+    B: 8
+    T: 32
+    H: 32
+    W: 32
+    C: 3
+    patch: 4
+    action_dim: 8
+    n_tasks: 128
+    horizon: 16
+    context_length: 8
+    max_steps: 10000
+    log_every: 200
+    lr: 0.0003
+    eval_every: 2000
+    eval_episodes: 2
+    eval_batch_size: 2
+    eval_horizon: 16
+    write_video_every: 0
+    visualize_every: 0
+    ckpt_save_every: 5000
+    ckpt_max_to_keep: 3
+    pixels_per_step: 2
+
+  eval: {}
+  report: {}
+

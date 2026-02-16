@@ -1,6 +1,10 @@
-# train_bc_rew_heads.py
-# given the pretrained world model, train the agent tokens with bc and rew prediction.
-# while still applying the diffusion / shortcut loss.
+"""Dreamer4 JAX 第三阶段：BC + Reward Head 联合训练脚本。
+
+在冻结/部分冻结世界模型参数的前提下，训练 agent token 相关读出头：
+- 行为克隆（PolicyHeadMTP）；
+- 奖励预测（RewardHeadMTP）；
+并保留 shortcut/diffusion 路径约束，维持潜空间动力学一致性。
+"""
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -24,9 +28,9 @@ except ImportError:
     WANDB_AVAILABLE = False
     wandb = None
 
-# UPDATED: bring in heads + task embedder
+# 引入行为头、奖励头与任务嵌入模块
 from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
-from dreamer.data import make_iterator
+from dreamer.envs import get_env_spec, make_iterator, unpack_batch
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
@@ -50,6 +54,7 @@ class RealismConfig:
     log_dir: str = "./logs"
     ckpt_max_to_keep: int = 2
     ckpt_save_every: int = 10_000
+    env_name: str = "bouncing_square"
 
 
     # wandb config
@@ -85,7 +90,7 @@ class RealismConfig:
     n_register: int = 4 # number of register tokens for dynamics
     n_agent: int = 1 # number of agent tokens for dynamics
 
-    # UPDATED: default to wm_agent (fine-tuning with agent readouts)
+    # 默认使用 wm_agent，便于在微调时读出 agent token
     agent_space_mode: str = "wm_agent"
 
     # schedule
@@ -101,7 +106,7 @@ class RealismConfig:
     # eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
-    # NEW: multi-token prediction (MTP) settings
+    # 多步预测（MTP）配置
     L: int = 2                      # predict next L actions/rewards
     num_reward_bins: int = 101      # twohot bins for symexp rewards
     reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
@@ -119,13 +124,16 @@ class RealismConfig:
 # ---------------------------
 
 def _ensure_dir(p: Path) -> Path:
+    """确保目录存在并返回路径对象。"""
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 def _to_uint8(img_f32):
+    """将 [0,1] 浮点图像转为 uint8。"""
     return np.asarray(np.clip(np.asarray(img_f32) * 255.0, 0, 255), dtype=np.uint8)
 
 def _stack_wide(*imgs_hwC):
+    """将多张图按宽度拼接。"""
     return np.concatenate(imgs_hwC, axis=1)
 
 def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: int = 0) -> np.ndarray:
@@ -161,6 +169,7 @@ def load_pretrained_tokenizer(
     dec_vars,
     sample_patches_btnd,
 ):
+    """恢复 tokenizer 参数，供后续 dynamics/heads 训练使用。"""
     meta_mngr = make_manager(tokenizer_ckpt_dir, item_names=("meta",))
     latest = meta_mngr.latest_step()
     if latest is None:
@@ -288,7 +297,7 @@ def train_step_efficient(
     encoder, dynamics, task_embedder, policy_head, reward_head, tx,
     params, opt_state,
     enc_vars, dyn_vars, task_vars, pi_vars, rew_vars,
-    frames, actions, rewards,
+    frames, actions, rewards, task_ids,
     *,
     patch: int,
     B: int, T: int, B_self: int,            # assume 0 <= B_self < B
@@ -367,8 +376,6 @@ def train_step_efficient(
     sigma_idx_plus    = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
 
     # --- Agent tokens from (dummy) task IDs (B,) -> (B,T,n_agent,D) ---
-    dummy_task_ids = jnp.zeros((B,), dtype=jnp.int32)
-
     def loss_and_aux(p):
         # Bind params into modules (preserving other collections)
         local_dyn  = with_params(dyn_vars,  p["dyn"])
@@ -377,7 +384,7 @@ def train_step_efficient(
         local_rw   = with_params(rew_vars,  p["rew"])
 
         # Agent tokens (recomputed under current task params)
-        agent_tokens = task_embedder.apply(local_task, dummy_task_ids, B, T)
+        agent_tokens = task_embedder.apply(local_task, task_ids, B, T)
 
         # Main forward (emp + self) → z1_hat and agent readouts h
         z1_hat_full, h_btnd = dynamics.apply(
@@ -739,7 +746,8 @@ def initialize_models_and_tokenizer(
         n_spatial=n_spatial, n_register=cfg.n_register,
         n_heads=cfg.n_heads, depth=cfg.dyn_depth,
         space_mode=cfg.agent_space_mode, n_agent=cfg.n_agent,
-        dropout=0.0, k_max=k_max, 
+        dropout=0.0, k_max=k_max,
+        n_actions=cfg.action_dim + 1,
         time_every=4,
     )
 
@@ -835,7 +843,8 @@ def run_evaluation(
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
     """
     val_rng = jax.random.PRNGKey(9999)
-    _, (val_frames, val_actions, val_rewards) = next_batch(val_rng)
+    _, val_batch = next_batch(val_rng)
+    val_frames, val_actions, val_rewards, _ = unpack_batch(val_batch, batch_size=cfg.B)
     # UPDATED: bind only the dynamics params
     dyn_vars_eval = with_params(train_state.dyn_vars, train_state.params["dyn"])
     ctx_length = min(32, cfg.T - 1)
@@ -891,6 +900,14 @@ def run_evaluation(
 # ---------------------------
 
 def run(cfg: RealismConfig):
+    env_spec = get_env_spec(cfg.env_name)
+    cfg = RealismConfig(
+        **{
+            **asdict(cfg),
+            "action_dim": env_spec.action_dim,
+            "n_tasks": max(cfg.n_tasks, env_spec.n_tasks),
+        }
+    )
     # Initialize wandb if enabled
     if cfg.use_wandb:
         if not WANDB_AVAILABLE:
@@ -915,20 +932,28 @@ def run(cfg: RealismConfig):
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
     # Data iterator (streaming)
+    iterator_kwargs = dict(pixels_per_step=cfg.pixels_per_step)
+    if env_spec.name == "bouncing_square":
+        iterator_kwargs.update(
+            size_min=cfg.size_min,
+            size_max=cfg.size_max,
+            hold_min=cfg.hold_min,
+            hold_max=cfg.hold_max,
+            fg_min_color=0 if cfg.diversify_data else 128,
+            fg_max_color=255 if cfg.diversify_data else 128,
+            bg_min_color=0 if cfg.diversify_data else 255,
+            bg_max_color=255 if cfg.diversify_data else 255,
+        )
     next_batch = make_iterator(
+        cfg.env_name,
         cfg.B, cfg.T, cfg.H, cfg.W, cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min, size_max=cfg.size_max,
-        hold_min=cfg.hold_min, hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
+        **iterator_kwargs,
     )
 
     # Initialize models and restore tokenizer
     init_rng = jax.random.PRNGKey(0)
-    _, (frames_init, actions_init, _) = next_batch(init_rng)
+    _, batch_init = next_batch(init_rng)
+    frames_init, actions_init, _, _ = unpack_batch(batch_init, batch_size=cfg.B)
 
     train_state = initialize_models_and_tokenizer(cfg, frames_init, actions_init)
 
@@ -975,7 +1000,8 @@ def run(cfg: RealismConfig):
     for step in range(start_step, cfg.max_steps + 1):
         # Data
         data_rng, batch_key = jax.random.split(data_rng)
-        _, (frames, actions, rewards) = next_batch(batch_key)
+        _, batch = next_batch(batch_key)
+        frames, actions, rewards, task_ids = unpack_batch(batch, batch_size=cfg.B)
 
         # RNG for this step
         train_rng, master_key = jax.random.split(train_rng)
@@ -991,7 +1017,7 @@ def run(cfg: RealismConfig):
             train_state.params, train_state.opt_state,
             train_state.enc_vars, train_state.dyn_vars, train_state.task_vars,
             train_state.pi_vars, train_state.rew_vars,
-            frames, actions, rewards,
+            frames, actions, rewards, task_ids,
             patch=cfg.patch, B=cfg.B, T=cfg.T, B_self=B_self,
             n_spatial=n_spatial, k_max=k_max, packing_factor=cfg.packing_factor,
             L=cfg.L,
@@ -1068,6 +1094,7 @@ def run(cfg: RealismConfig):
 if __name__ == "__main__":
     cfg = RealismConfig(
         run_name="train_bc_rew_flippedrew_test",
+        env_name="grasping_2p5d",
         tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
         pretrained_dyn_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_ndynamics_newattn/checkpoints",
         use_wandb=False,
@@ -1083,7 +1110,7 @@ if __name__ == "__main__":
         loss_weight_shortcut=1.0,
         loss_weight_policy=0.3,
         loss_weight_reward=0.3,
-        action_dim=4,
+        action_dim=8,
     )
     print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
     run(cfg)

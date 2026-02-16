@@ -16,7 +16,7 @@ import orbax.checkpoint as ocp
 
 # Project imports
 from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
-from dreamer.data import make_iterator
+from dreamer.envs import get_env_spec, make_iterator, unpack_batch
 from dreamer.utils import (
     temporal_patchify, pack_bottleneck_to_spatial, 
     with_params, make_state, make_manager, pack_mae_params,
@@ -35,6 +35,7 @@ class EvalConfig:
     run_ckpt_dir: str                         # training run checkpoints dir to restore params from
     tokenizer_ckpt: str                       # tokenizer ckpt (for enc/dec)
     out_dir: str = "./eval_out"
+    env_name: str = "bouncing_square"
 
     # Data
     B: int = 8

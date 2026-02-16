@@ -1,7 +1,8 @@
-# train_dynamics.py
-# Streaming-batch training on synthetic data with teacher-forced training and autoregressive evaluation.
-# This version keeps ONLY the efficient training step and adds robust Orbax checkpointing.
-# It restores the pretrained tokenizer (enc/dec) and trains the dynamics model.
+"""Dreamer4 JAX 第二阶段：Dynamics 训练脚本。
+
+该脚本在已训练 tokenizer 的基础上训练世界模型动力学模块，
+包含 teacher-forced 主损失、自一致性 bootstrap 分支，以及 Orbax 检查点管理。
+"""
 
 from __future__ import annotations
 from dataclasses import dataclass, asdict
@@ -26,7 +27,7 @@ except ImportError:
     wandb = None
 
 from dreamer.models import Encoder, Decoder, Dynamics
-from dreamer.data import make_iterator
+from dreamer.envs import get_env_spec, make_iterator, unpack_batch
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
@@ -49,6 +50,7 @@ class RealismConfig:
     log_dir: str = "./logs"
     ckpt_max_to_keep: int = 2
     ckpt_save_every: int = 10_000
+    env_name: str = "bouncing_square"
 
     # wandb config
     use_wandb: bool = False
@@ -67,6 +69,7 @@ class RealismConfig:
     hold_min: int = 4
     hold_max: int = 9
     diversify_data: bool = True
+    action_dim: int = 4
 
     # tokenizer / dynamics config
     patch: int = 4
@@ -101,13 +104,16 @@ class RealismConfig:
 # ---------------------------
 
 def _ensure_dir(p: Path) -> Path:
+    """确保目录存在并返回该目录路径。"""
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 def _to_uint8(img_f32):
+    """将 [0,1] 浮点图像转换为 uint8。"""
     return np.asarray(np.clip(np.asarray(img_f32) * 255.0, 0, 255), dtype=np.uint8)
 
 def _stack_wide(*imgs_hwC):
+    """按宽度方向拼接多张同高图像。"""
     return np.concatenate(imgs_hwC, axis=1)
 
 def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: int = 0) -> np.ndarray:
@@ -143,6 +149,7 @@ def load_pretrained_tokenizer(
     dec_vars,
     sample_patches_btnd,
 ):
+    """从 tokenizer 检查点恢复 enc/dec 参数及元信息。"""
     meta_mngr = make_manager(tokenizer_ckpt_dir, item_names=("meta",))
     latest = meta_mngr.latest_step()
     if latest is None:
@@ -198,12 +205,11 @@ def train_step_efficient(
     n_spatial: int, k_max: int, packing_factor: int,
     master_key: jnp.ndarray, step: int, bootstrap_start: int,
 ):
-    """
-    Deterministic two-branch training (one fused main forward):
-      - first B_emp rows: empirical flow at d_min = 1/k_max
-      - last  B_self rows: bootstrap self-consistency with d > d_min
-    If step < bootstrap_start, the bootstrap contribution is masked to 0 (but we still
-    execute one fused path to keep a single jit and stable shapes).
+    """高效单步训练（融合经验分支 + bootstrap 分支）。
+
+    - 前 B_emp 条样本使用最细粒度 d_min=1/k_max 做流匹配；
+    - 后 B_self 条样本执行 bootstrap 自一致性约束；
+    - 在 warmup 期仅屏蔽 bootstrap 损失，不改变计算图形状。
     """
     @partial(jax.jit, static_argnames=("shape_bt","k_max",))
     def _sample_tau_for_step(rng, shape_bt, k_max:int, step_idx:jnp.ndarray, *, dtype=jnp.float32):
@@ -575,7 +581,8 @@ def initialize_models_and_tokenizer(
         n_spatial=n_spatial, n_register=cfg.n_register,
         n_heads=cfg.n_heads, depth=cfg.dyn_depth,
         space_mode=cfg.agent_space_mode, n_agent=cfg.n_agent,
-        dropout=0.0, k_max=k_max, 
+        dropout=0.0, k_max=k_max,
+        n_actions=cfg.action_dim + 1,
         time_every=4,
     )
 
@@ -648,7 +655,8 @@ def run_evaluation(
         vis_dir: Directory for visualization outputs
     """
     val_rng = jax.random.PRNGKey(9999)
-    _, (val_frames, val_actions, _) = next_batch(val_rng)
+    _, val_batch = next_batch(val_rng)
+    val_frames, val_actions, _, _ = unpack_batch(val_batch, batch_size=cfg.B)
     dyn_vars_eval = with_params(train_state.dyn_vars, train_state.params)
     ctx_length = min(32, cfg.T - 1)
     regimes = _eval_regimes_for_realism(cfg, ctx_length=ctx_length)
@@ -711,6 +719,8 @@ def run_evaluation(
 # ---------------------------
 
 def run(cfg: RealismConfig):
+    env_spec = get_env_spec(cfg.env_name)
+    cfg = RealismConfig(**{**asdict(cfg), "action_dim": env_spec.action_dim})
     # Initialize wandb if enabled
     if cfg.use_wandb:
         if not WANDB_AVAILABLE:
@@ -735,20 +745,28 @@ def run(cfg: RealismConfig):
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
     # Data iterator (streaming)
+    iterator_kwargs = dict(pixels_per_step=cfg.pixels_per_step)
+    if env_spec.name == "bouncing_square":
+        iterator_kwargs.update(
+            size_min=cfg.size_min,
+            size_max=cfg.size_max,
+            hold_min=cfg.hold_min,
+            hold_max=cfg.hold_max,
+            fg_min_color=0 if cfg.diversify_data else 128,
+            fg_max_color=255 if cfg.diversify_data else 128,
+            bg_min_color=0 if cfg.diversify_data else 255,
+            bg_max_color=255 if cfg.diversify_data else 255,
+        )
     next_batch = make_iterator(
+        cfg.env_name,
         cfg.B, cfg.T, cfg.H, cfg.W, cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min, size_max=cfg.size_max,
-        hold_min=cfg.hold_min, hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
+        **iterator_kwargs,
     )
 
     # Initialize models and restore tokenizer
     init_rng = jax.random.PRNGKey(0)
-    _, (frames_init, actions_init, _) = next_batch(init_rng)
+    _, batch_init = next_batch(init_rng)
+    frames_init, actions_init, _, _ = unpack_batch(batch_init, batch_size=cfg.B)
 
     train_state = initialize_models_and_tokenizer(cfg, frames_init, actions_init)
 
@@ -791,7 +809,8 @@ def run(cfg: RealismConfig):
     for step in range(start_step, cfg.max_steps + 1):
         # Data
         data_rng, batch_key = jax.random.split(data_rng)
-        _, (frames, actions, _) = next_batch(batch_key)
+        _, batch = next_batch(batch_key)
+        frames, actions, _, _ = unpack_batch(batch, batch_size=cfg.B)
 
         # RNG for this step
         train_rng, master_key = jax.random.split(train_rng)
@@ -866,6 +885,7 @@ def run(cfg: RealismConfig):
 if __name__ == "__main__":
     cfg = RealismConfig(
         run_name="train_dynamics_test",
+        env_name="grasping_2p5d",
         tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
         use_wandb=False,
         wandb_entity="edhu",

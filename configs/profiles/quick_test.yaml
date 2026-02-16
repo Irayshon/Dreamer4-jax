@@ -1,0 +1,32 @@
+includes:
+  - ../base.yaml
+  - ../env/grasping_2p5d.yaml
+
+experiment_name: dreamer4_grasping_quick_test
+
+stages:
+  tokenizer:
+    B: 8
+    T: 32
+    max_steps: 3000
+    lpips_frac: 0.25
+  dynamics:
+    B: 8
+    T: 32
+    max_steps: 5000
+    bootstrap_start: 500
+    write_video_every: 0
+  bc_rew:
+    B: 8
+    T: 32
+    max_steps: 5000
+    L: 2
+  policy:
+    B: 8
+    T: 32
+    horizon: 16
+    context_length: 8
+    max_steps: 10000
+    eval_every: 2000
+    eval_episodes: 2
+

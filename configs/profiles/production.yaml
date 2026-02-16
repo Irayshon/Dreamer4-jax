@@ -1,0 +1,45 @@
+includes:
+  - ../base.yaml
+  - ../env/grasping_2p5d.yaml
+
+experiment_name: dreamer4_grasping_production
+
+stages:
+  tokenizer:
+    B: 24
+    T: 64
+    max_steps: 120000
+    lpips_frac: 0.5
+    log_every: 500
+    ckpt_save_every: 10000
+  dynamics:
+    B: 20
+    T: 64
+    max_steps: 180000
+    bootstrap_start: 10000
+    self_fraction: 0.25
+    log_every: 500
+    ckpt_save_every: 10000
+  bc_rew:
+    B: 20
+    T: 64
+    max_steps: 140000
+    L: 2
+    loss_weight_shortcut: 1.0
+    loss_weight_policy: 0.3
+    loss_weight_reward: 0.3
+    log_every: 500
+    ckpt_save_every: 10000
+  policy:
+    B: 16
+    T: 64
+    horizon: 32
+    context_length: 16
+    max_steps: 220000
+    eval_every: 10000
+    eval_episodes: 8
+    eval_batch_size: 4
+    eval_horizon: 32
+    log_every: 500
+    ckpt_save_every: 10000
+

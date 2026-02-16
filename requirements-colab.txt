@@ -1,0 +1,10 @@
+# Colab GPU dependency baseline (tested with pipeline).
+jax==0.7.2
+jaxlib==0.7.2
+jax-cuda12-plugin==0.7.2
+jax-cuda12-pjrt==0.7.2
+jaxlpips
+flax>=0.12.0
+optax>=0.2.6
+einops>=0.8.1
+imageio>=2.37.0

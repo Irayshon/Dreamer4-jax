@@ -1,4 +1,10 @@
-# sampling logic for debugging / visualization. Not JIT friendly.
+"""Dreamer4 JAX 的可视化采样器（偏调试用途，非 JIT 路径）。
+
+本文件用于训练外分析：
+- 以 teacher-forced / autoregressive 方式滚动未来帧；
+- 导出可视化结果，便于比较不同去噪日程与起始策略；
+- 验证世界模型在不同 τ 设定下的行为。
+"""
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Tuple, Optional, Dict, Any, Callable
@@ -24,6 +30,11 @@ RolloutMode = Literal["teacher_forced", "autoregressive"]
 
 @dataclass
 class SamplerConfig:
+    """采样配置。
+
+    设计目标是把“日程策略、起始噪声策略、滚动模式、可视化参数”集中管理，
+    让训练脚本与评估脚本复用同一套配置语义。
+    """
     k_max: int
     schedule: Schedule                      # "finest" or "shortcut"
     d: Optional[float] = None               # used iff schedule == "shortcut"
@@ -111,6 +122,7 @@ def _tau_grid_from(k_max: int, schedule: Schedule, d_opt: Optional[float], start
 # ---------- Plan builder (host-only) ----------
 
 def _build_run_plan(cfg: SamplerConfig) -> dict:
+    """构建一次采样运行的 host 侧计划摘要（用于日志/调试钩子）。"""
     d_used = _choose_step_size(cfg.k_max, cfg.schedule, cfg.d)
     e = _step_idx_from_d(d_used, cfg.k_max)
     d_inv = int(round(1.0 / d_used))
@@ -182,10 +194,12 @@ def denoise_single_latent(
     match_ctx_tau: bool = False,
 ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
     """
-    Denoise a single future latent using a τ-ladder.
-      - Uses adaptive mixing α = (τ_{s+1} − τ_s) / (1 − τ_s)
-      - If match_ctx_tau=True, corrupt context to current τ at each step using a fixed z0_ctx
-      - Returns both the denoised latent and the hidden state h_t from the final step
+    使用 τ-ladder 对“单个未来潜变量”去噪。
+
+    关键机制：
+      - 自适应混合系数 α = (τ_{s+1} − τ_s) / (1 − τ_s)；
+      - match_ctx_tau=True 时，每步将 context 腐化到当前 τ；
+      - 返回最终潜变量以及最后一步隐状态 h_t。
     
     Returns:
         z_t: (B, 1, n_spatial, D_s) denoised latent

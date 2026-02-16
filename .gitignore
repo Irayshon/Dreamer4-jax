@@ -162,6 +162,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+!configs/env/
+!configs/env/*.yaml
 
 # Spyder project settings
 .spyderproject
@@ -220,3 +222,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+runs/
+__pycache__/
+*.pyc
+.tmp_tests/

@@ -1,21 +1,9 @@
-"""
-JIT-friendly policy/value training using imagination rollouts.
+"""Dreamer4 JAX 第四阶段：基于 imagination 的策略/价值联合训练。
 
-High-level outline (from the docstring plan):
-
-- Trajectory Generation
-    - Roll out the policy in latent space starting from a ground-truth context.
-    - Unroll π(a|s) from s0 for `horizon` steps, creating latent states s1…sT.
-    - Collect policy actions a1…aT and hidden states h0…hT.
-
-- Reward / Value annotation
-    - Use the reward head on h1…hT to get r1…rT.
-    - Use the value head on h0…hT to get V0…VT.
-    - Compute TD-λ returns G0…G{T-1} using V1…VT and r1…rT (with bootstrap VT).
-
-- Value / Policy updates
-    - Train V_head on (s0…s{T-1}) to regress G0…G{T-1}.
-    - Train policy head on (s0…s{T-1}, a1…aT, G0…G{T-1}, V0…V{T-1}) using PMPO.
+流程概览：
+1) 在潜空间从 context 出发滚动 horizon 步，得到 imagined states/actions/hidden；
+2) 用奖励头和价值头标注轨迹，计算 TD-λ 目标回报；
+3) 训练价值头回归回报，训练策略头执行 PMPO 风格更新。
 """
 from __future__ import annotations
 from dataclasses import dataclass, asdict
@@ -24,6 +12,7 @@ from typing import Dict, Any
 from functools import partial
 import time
 import math
+import json
 
 import jax
 import jax.numpy as jnp
@@ -52,7 +41,13 @@ from dreamer.models import (
     RewardHeadMTP,
     ValueHead,
 )
-from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn
+from dreamer.envs import (
+    get_env_spec,
+    make_iterator,
+    make_env_reset_fn,
+    make_env_step_fn,
+    unpack_batch,
+)
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
@@ -84,6 +79,7 @@ class RLConfig:
     log_dir: str = "./logs"
     ckpt_max_to_keep: int = 2
     ckpt_save_every: int = 10_000
+    env_name: str = "bouncing_square"
 
     # wandb config
     use_wandb: bool = False
@@ -163,6 +159,7 @@ class RLConfig:
 
 
 def _ensure_dir(p: Path) -> Path:
+    """确保目录存在并返回路径对象。"""
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -523,6 +520,10 @@ class EpisodeResult:
     actions: jnp.ndarray  # (B, horizon+1)
     rewards: jnp.ndarray  # (B, horizon+1)
     returns: jnp.ndarray  # (B,)
+    grasp_seen: jnp.ndarray  # (B,)
+    placement_seen: jnp.ndarray  # (B,)
+    attach_steps: jnp.ndarray  # (B,)
+    final_goal_distance: jnp.ndarray  # (B,)
 
 
 # ---------------------------
@@ -581,6 +582,7 @@ def initialize_models(
         n_agent=cfg.n_agent,
         dropout=0.0,
         k_max=k_max,
+        n_actions=cfg.action_dim + 1,
         time_every=4,
     )
 
@@ -998,6 +1000,7 @@ def eval_rollout_real_env(
 
     # Reset environment and get initial observation / null action.
     env_state, s0, a0, r0 = env_reset_fn(rng_env)
+    task_ids = jnp.asarray(env_state.get("task_id", task_ids), dtype=jnp.int32)
     B, H, W, C = s0.shape
 
     # Encode initial observation into spatial tokens (single frame).
@@ -1072,11 +1075,12 @@ def eval_rollout_real_env(
         return carry_next, outputs_t
 
     init_carry = (env_state, z_ctx_init, actions_ctx_init, rng_roll)
-    _, outputs = jax.lax.scan(
+    final_carry, outputs = jax.lax.scan(
         scan_body,
         init_carry,
         jnp.arange(horizon),
     )
+    env_state_final = final_carry[0]
 
     obs_seq, actions_seq, rewards_seq = outputs
     # obs_seq:     (horizon, B, H, W, C)
@@ -1095,11 +1099,24 @@ def eval_rollout_real_env(
     # Episode returns (ignore r0 which is NaN).
     returns = jnp.nansum(rewards_full[:, 1:], axis=-1)  # (B,)
 
+    goal_center = jnp.asarray(
+        env_state_final.get("goal_center", jnp.zeros_like(env_state_final["object_pos"])),
+        dtype=jnp.float32,
+    )
+    final_goal_distance = jnp.linalg.norm(
+        env_state_final["object_pos"].astype(jnp.float32) - goal_center.astype(jnp.float32),
+        axis=-1,
+    )
+
     return EpisodeResult(
         frames=frames_full,
         actions=actions_full,
         rewards=rewards_full,
         returns=returns,
+        grasp_seen=jnp.asarray(env_state_final.get("grasp_seen", jnp.zeros((B,), dtype=bool))),
+        placement_seen=jnp.asarray(env_state_final.get("placement_seen", jnp.zeros((B,), dtype=bool))),
+        attach_steps=jnp.asarray(env_state_final.get("attach_steps", jnp.zeros((B,), dtype=jnp.int32))),
+        final_goal_distance=final_goal_distance,
     )
 
 
@@ -1212,11 +1229,17 @@ def evaluate_policy_real_env(
 
     media: Dict[str, Any] = {}
     if first_result is not None:
+        metrics["eval/grasp_success_rate"] = float(jnp.mean(first_result.grasp_seen.astype(jnp.float32)))
+        metrics["eval/place_success_rate"] = float(jnp.mean(first_result.placement_seen.astype(jnp.float32)))
+        metrics["eval/attach_steps_mean"] = float(jnp.mean(first_result.attach_steps.astype(jnp.float32)))
+        metrics["eval/final_goal_distance_mean"] = float(jnp.mean(first_result.final_goal_distance))
         # Keep a small batch of frames/actions/rewards for later visualization.
         media = {
             "frames": first_result.frames,
             "actions": first_result.actions,
             "rewards": first_result.rewards,
+            "grasp_seen": first_result.grasp_seen,
+            "placement_seen": first_result.placement_seen,
         }
 
     return metrics, media, eval_rng
@@ -1533,6 +1556,14 @@ def train_step(
 
 
 def run(cfg: RLConfig):
+    env_spec = get_env_spec(cfg.env_name)
+    cfg = RLConfig(
+        **{
+            **asdict(cfg),
+            "action_dim": env_spec.action_dim,
+            "n_tasks": max(cfg.n_tasks, env_spec.n_tasks),
+        }
+    )
     # Initialize wandb if enabled
     if cfg.use_wandb:
         if not WANDB_AVAILABLE:
@@ -1561,28 +1592,35 @@ def run(cfg: RLConfig):
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
+    metrics_jsonl_path = run_dir / "metrics.jsonl"
 
     # Data iterator
+    iterator_kwargs = dict(pixels_per_step=cfg.pixels_per_step)
+    if env_spec.name == "bouncing_square":
+        iterator_kwargs.update(
+            size_min=cfg.size_min,
+            size_max=cfg.size_max,
+            hold_min=cfg.hold_min,
+            hold_max=cfg.hold_max,
+            fg_min_color=0 if cfg.diversify_data else 128,
+            fg_max_color=255 if cfg.diversify_data else 128,
+            bg_min_color=0 if cfg.diversify_data else 255,
+            bg_max_color=255 if cfg.diversify_data else 255,
+        )
     next_batch = make_iterator(
+        cfg.env_name,
         cfg.B,
         cfg.T,
         cfg.H,
         cfg.W,
         cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min,
-        size_max=cfg.size_max,
-        hold_min=cfg.hold_min,
-        hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
+        **iterator_kwargs,
     )
 
     # Initialize models and load checkpoints
     init_rng = jax.random.PRNGKey(0)
-    _, (frames_init, actions_init, rewards_init) = next_batch(init_rng)
+    _, batch_init = next_batch(init_rng)
+    frames_init, actions_init, rewards_init, _ = unpack_batch(batch_init, batch_size=cfg.B)
     del rewards_init
 
     train_state = initialize_models(cfg, frames_init, actions_init)
@@ -1605,24 +1643,24 @@ def run(cfg: RLConfig):
     schedule = _build_static_schedule(imag_cfg)
 
     # Real-environment evaluation env fns.
-    env_reset_fn = make_env_reset_fn(
+    env_reset_kwargs = dict(
         batch_size=cfg.eval_batch_size,
         height=cfg.H,
         width=cfg.W,
         channels=cfg.C,
         pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min,
-        size_max=cfg.size_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
     )
-    env_step_fn = make_env_step_fn(
-        height=cfg.H,
-        width=cfg.W,
-        channels=cfg.C,
-    )
+    if env_spec.name == "bouncing_square":
+        env_reset_kwargs.update(
+            size_min=cfg.size_min,
+            size_max=cfg.size_max,
+            fg_min_color=0 if cfg.diversify_data else 128,
+            fg_max_color=255 if cfg.diversify_data else 128,
+            bg_min_color=0 if cfg.diversify_data else 255,
+            bg_max_color=255 if cfg.diversify_data else 255,
+        )
+    env_reset_fn = make_env_reset_fn(cfg.env_name, **env_reset_kwargs)
+    env_step_fn = make_env_step_fn(cfg.env_name, height=cfg.H, width=cfg.W, channels=cfg.C)
 
     # Checkpoint manager and optional restore
     mngr = make_manager(
@@ -1672,13 +1710,12 @@ def run(cfg: RLConfig):
     eval_rng = jax.random.PRNGKey(98765)
 
     start_wall = time.time()
+    latest_eval_metrics: Dict[str, float] | None = None
     for step in range(start_step, cfg.max_steps + 1):
         # Sample batch
         data_rng, batch_key = jax.random.split(data_rng)
-        _, (videos, actions_full, rewards_full) = next_batch(batch_key)
-
-        # Task IDs (currently dummy zeros)
-        task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
+        _, batch = next_batch(batch_key)
+        videos, actions_full, rewards_full, task_ids = unpack_batch(batch, batch_size=cfg.B)
 
         # JITted train step
         train_rng, step_key = jax.random.split(train_rng)
@@ -1750,6 +1787,9 @@ def run(cfg: RLConfig):
                 f"return_min={metrics_eval['eval/return_min']:.4f} | "
                 f"return_max={metrics_eval['eval/return_max']:.4f}"
             )
+            latest_eval_metrics = {k: float(v) for k, v in metrics_eval.items()}
+            with metrics_jsonl_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"step": int(step), **latest_eval_metrics}, ensure_ascii=True) + "\n")
 
             # Optional visualization: write MP4 + strip plots at a lower frequency.
             video_path: Path | None = None
@@ -1868,12 +1908,14 @@ def run(cfg: RLConfig):
     if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
         wandb.finish()
         print("[wandb] Finished logging.")
+    return latest_eval_metrics if latest_eval_metrics is not None else {}
 
 
 if __name__ == "__main__":
     cfg = RLConfig(
         run_name="train_policy_jit_flippedrew2_test",
         bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_flippedrew/checkpoints",
+        env_name="grasping_2p5d",
         use_wandb=False,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",

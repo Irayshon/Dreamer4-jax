@@ -1,4 +1,10 @@
-# imagination.py - JIT-friendly image / video sampling for the dynamics model during RL.
+"""Dreamer4 JAX 中用于策略训练的“想象滚动”模块。
+
+核心职责：
+1) 构建静态去噪日程（τ-ladder），保证 JIT 友好；
+2) 在潜空间中执行单步或多步 imagination rollout；
+3) 将策略函数与世界模型解耦，便于替换不同行为策略。
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -27,8 +33,9 @@ def _assert_power_of_two(k: int):
 
 def _step_idx_from_d(d: float, k_max: int) -> int:
     """
-    Map a step size d (which must be 1/(power of two)) to an integer step index e
-    compatible with the dynamics' k_max grid.
+    将步长 d（必须是 1/2^n）映射为离散 step index e。
+
+    该索引用于与 dynamics 的 k_max 离散网格对齐。
     """
     K = round(1.0 / float(d))
     if abs(1.0 / K - d) > 1e-8:
@@ -49,9 +56,10 @@ def _step_idx_from_d(d: float, k_max: int) -> int:
 @dataclass(frozen=True)
 class ImaginationConfig:
     """
-    Static configuration for imagination rollouts.
-    All fields are intended to be fixed at construction time so that
-    JAX can treat shapes and control-flow lengths as static.
+    imagination 过程的静态配置。
+
+    这些字段应在构造时固定，以便 JAX 将形状与控制流长度视为静态值，
+    从而稳定编译并减少重编译开销。
     """
 
     k_max: int
@@ -66,7 +74,7 @@ class ImaginationConfig:
 
 class DenoiseSchedule(NamedTuple):
     """
-    Precomputed, JAX-friendly schedule for the τ-ladder.
+    预计算的 τ-ladder 日程（JAX 友好）。
 
     tau_seq:        (S+1,) τ_0..τ_S (monotone, τ_0 ∈ [0,1), τ_S=1.0)
     alpha_seq:      (S,)   per-step mixing coefficients α_s
@@ -86,8 +94,9 @@ class DenoiseSchedule(NamedTuple):
 
 def _build_static_schedule(cfg: ImaginationConfig) -> DenoiseSchedule:
     """
-    Host-side helper that constructs a fixed τ-ladder schedule.
-    This is run once at sampler construction time (not inside JIT).
+    在 host 端构建固定 τ-ladder。
+
+    该函数只在采样器初始化时执行一次，不在 JIT 图内执行。
     """
     _assert_power_of_two(cfg.k_max)
 
@@ -158,11 +167,11 @@ def denoise_single_latent_static(
     z0_ctx: jnp.ndarray | None = None,        # (B, T_ctx, n_spatial, D_s) base noise for context
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    JAX-friendly τ-ladder denoiser for a single future latent.
+    对“单个未来潜变量”执行 JAX 友好的 τ-ladder 去噪。
 
-    - Uses a precomputed schedule (τ_seq, α_seq, signal_idx_seq, step_idx).
-    - Contains only JAX ops in the inner loop (no Python branching on traced values).
-    - Returns both the denoised latent and the final hidden state h_t from dynamics.
+    - 使用预计算 schedule（τ_seq、α_seq、signal_idx_seq、step_idx）；
+    - 内循环仅包含 JAX 运算，避免 traced 值上的 Python 分支；
+    - 返回最终去噪潜变量与最后一步的 dynamics 隐状态 h_t。
 
     Args:
         dynamics: Dynamics model (Flax Module)
@@ -269,9 +278,9 @@ def make_gt_action_policy_fn(
     action_dim: int,
 ) -> Tuple[PolicyFn, dict]:
     """
-    Build a policy_fn/state pair that feeds ground-truth actions into rollout_latents.
+    构造“回放真值动作”的 policy_fn/state。
 
-    gt_actions[:, t] is used as the action at imagination step t.
+    即在 imagination 第 t 步使用 gt_actions[:, t] 作为动作。
     """
     init_state = {
         "gt_actions": gt_actions,           # (B, horizon)
@@ -315,13 +324,13 @@ def imagine_rollouts_core(
     rng_key: jax.Array,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Core JAX-friendly imagination rollout in latent space.
+    潜空间 imagination rollout 的核心实现（JAX 友好）。
 
-    This function:
-      - Computes initial hidden state from context using dynamics.
-      - Uses a generic policy_fn(h, rng, state) to produce actions & logits.
-      - Uses denoise_single_latent_static to predict next latents.
-      - Rolls context autoregressively.
+    该函数会：
+      - 用 context 通过 dynamics 得到初始隐状态；
+      - 调用通用 policy_fn(h, rng, state) 产生动作与 logits；
+      - 通过 denoise_single_latent_static 预测下一潜状态；
+      - 以自回归方式滚动 context 窗口。
 
     Returns:
         imagined_latents: (B, horizon + 1, n_spatial, d_spatial)

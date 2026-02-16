@@ -1,138 +1,297 @@
-# Dreamer 4 World Models, in pure JAX
+# Core Dreamer4 Mechanisms in JAX for Toy Control and 2.5D Grasping
 
-This repo is an unofficial implementation of the **[Dreamer 4](https://danijar.com/project/dreamer4/)** world model and RL agent from *“Training Agents Inside of Scalable World Models”* in pure JAX. This repo is designed to be educational and serve as a starting point for those interested in world models, RL, and Jax. 
+This repository is an unofficial JAX implementation of the core training pipeline introduced in [Dreamer4](https://danijar.com/project/dreamer4/), focused on understanding and validating the method on a small synthetic control problem and then extending it toward a robotics-inspired 2.5D visual grasping benchmark.
+
+It is best described as:
+
+- a **core Dreamer4 mechanism reproduction in JAX**
+- a **dual-path research artifact** with a stable toy baseline and an in-progress grasping path
+- a **research portfolio project** for world models and imagination-based RL
+
+It is not a claim of full paper reproduction on Minecraft-scale data, and it should not be described as a real robot manipulation system.
 
 ![dreamer4](docs/architecture.png)
 
-At this stage, the entire world model + RL pipeline has been implemented and verified on a small bouncing square dataset. The authors are extending the codebase to solve harder tasks like CoinRun and eventually, Minecraft.  
+## What This Repo Covers
 
-> [!NOTE]
-> We are looking for support - in terms of compute, advising, or feature development. Please get in touch if interested!
+The current codebase implements the main Dreamer4-style ingredients:
 
+- **Causal tokenizer** trained with MAE-style masking and MSE/LPIPS reconstruction
+- **Interactive dynamics model** with shortcut forcing, x-prediction, and ramp loss weighting
+- **Agent/task tokens** plus behavior cloning and reward modeling heads
+- **Imagination training** with TD-lambda returns, PMPO-style policy updates, and KL regularization to a BC prior
+- **Environment-aware training/eval routing** for both the toy and grasping paths
+- **Task-conditioned manipulation batches** for the new goal-conditioned grasping benchmark
 
-- [Website](https://danijar.com/project/dreamer4/)
-- [Twitter](https://x.com/danijarh/status/1973072288351396320)
+The repository now has two environment paths:
 
-## Demo
+- `bouncing_square`: the stable reference baseline used to validate the full 4-stage pipeline
+- `grasping_2p5d`: a robotics-inspired top-down manipulation environment with task IDs and a larger discrete action space
 
-At a high level, Dreamer 4 first trains an action-conditioned video diffusion model of the environment. Here, we show that the world model has learned to accurately predict the real dynamics of the bouncing square dataset.
-<figure>
-    <img src="docs/imagination-cropped.gif">
-</figure>
+The grasping path should be presented honestly as an in-progress benchmark extension for mechanism-level evaluation, not as a full manipulation benchmark reproduction.
 
+## Current Status
 
-Then, the agent is trained with RL in the world model. The reward is the proximity to the center of the image. We can see that the agent successfully learns to hover near the center.
-<figure>
-    <img src="docs/rl-cropped.gif">
-</figure>
+What is already in place:
 
+- End-to-end 4-stage training pipeline under `scripts/`
+- Visualizations and example training curves under `docs/`
+- World model, policy, value, and reward heads in pure JAX/Flax
+- JIT-friendly imagination rollout utilities
+- `dreamer/envs.py` environment factory helpers shared across toy and grasping setups
+- `dreamer/grasping_env.py` for deterministic top-down 2.5D grasping demos and evaluation
 
+What is still missing for a paper-level reproduction:
+
+- Large-scale offline video datasets
+- Minecraft-scale experiments
+- Unlabeled-video plus small action-conditioned-data training regime
+- Full paper engineering details such as RoPE, GQA, KV caching, and complete loss RMS normalization
+- Fully validated stronger-environment results beyond the toy baseline
+
+The practical takeaway is: this repo is already a strong starting point for studying Dreamer4-style world models, with a validated toy baseline and a promising grasping extension that is still under active validation.
 
 ## Repo Structure
-- **Core library (`dreamer/`)**
-  - `models.py` -- Space-time axial attention, causal tokenizer, interactive dynamics model, agent / reward / value heads.
-  - `data.py` -- Bouncing square dataset and environment 
-  - `imagination.py` -- JIT-fused imagination / diffusion-style rollout code used for fast RL in latent space.
-  - `sampler.py` - non-JIT sampling helpers for debugging / visualization.
-  - `utils.py` -- training state helpers, checkpointing wrappers (Orbax), logging helpers.
-- **Training & evaluation scripts (`scripts/`)**
-  - `train_tokenizer.py` -- Trains the causal tokenizer (masked autoencoder over video).
-  - `train_dynamics.py` -- Trains the interactive dynamics model on top of the frozen tokenizer.
-  - `train_bc_rew_heads.py` -- Adds behavior cloning and reward prediction heads on the world model (agent tokens + reward head).
-  - `train_policy.py` -- Runs Dreamer‑style RL purely in imagination using the learned world model and heads (PMPO-style update).
-  - `eval_bc_rew_heads.py` -- Evaluation script to verify BC / reward finetuning
-- **Docs & logs**
-  - `docs/` -- Figures, videos, and notes from development (e.g., reconstructions, imagination rollouts).
 
-This repo is intentionally built to be easy to modify. If you want to understand or change the algorithm, start from the training scripts under `scripts/` and follow the calls into `dreamer/`.
+- `dreamer/`
+  - `models.py`: tokenizer, dynamics model, token routing, policy/value/reward heads
+  - `data.py`: bouncing-square dataset and toy environment
+  - `envs.py`: shared environment factory and batch-normalization helpers
+  - `grasping_env.py`: robotics-inspired 2.5D top-down grasping environment
+  - `imagination.py`: latent rollout and denoising schedule utilities
+  - `sampler.py`: sampling helpers and visualization utilities
+  - `utils.py`: checkpointing, state helpers, patchify helpers
+- `scripts/`
+  - `train_tokenizer.py`
+  - `train_dynamics.py`
+  - `train_bc_rew_heads.py`
+  - `train_policy.py`
+  - `eval_bc_rew_heads.py`
+- `docs/`
+  - figures, training curves, paper text extracts, and research-facing docs added in this pass
 
 ## Setup
 
-We use `uv` to manage the environment and dependencies (see `pyproject.toml` / `uv.lock`):
+We use `uv` for environment management:
 
 ```bash
-uv sync      # creates .venv and installs packages
-source .venv/bin/activate # activate venv
-uv pip install -e . # install this project as an editable package
+uv sync
+uv pip install -e .
 ```
 
-By default, this installs the **CPU** version of JAX. For GPUs, follow the official JAX instructions, for example:
+By default this installs CPU JAX. For GPU, install the appropriate JAX build manually, for example:
 
 ```bash
 uv pip install "jax[cuda12]"
 ```
 
-The code should run on any relatively recent GPU, but all logic should also run (more slowly) on CPU.
+## Run Pipeline
 
-## Training Pipeline
-Dreamer 4 follows a 4-stage training pipeline.
-- **Phase 1**: Train a causal tokenizer (MAE-style) on videos.
-- **Phase 2**: Train an interactive dynamics model in latent space of the tokenizer.
-- **Phase 3**: Add agent tokens, BC / reward heads with behavior cloning and reward prediction.
-- **Phase 4**: Train a policy on imagination trajectories from the dynamics model.
-
-The default experiments use the synthetic **bouncing square** dataset, where an agent controls a square in a small grid using WASD commands and is rewarded for staying in the center.
-
-To run the training pipeline, edit the configs in each script's `__main__` block and execute:
+Use the unified pipeline entrypoint instead of manually editing script `__main__` blocks:
 
 ```bash
-# Phase 1: Train the causal tokenizer
-python scripts/train_tokenizer.py
-
-# Phase 2: Train the dynamics model (requires tokenizer checkpoint)
-python scripts/train_dynamics.py
-# Edit tokenizer_ckpt in the config to point to your Phase 1 checkpoint
-
-# Phase 3: Train BC/reward heads (requires tokenizer + dynamics checkpoints)
-python scripts/train_bc_rew_heads.py
-# Edit tokenizer_ckpt and pretrained_dyn_ckpt in the config
-
-# Phase 4: Train policy in imagination (requires BC/reward checkpoint)
-python scripts/train_policy.py
-# Edit bc_rew_ckpt in the config to point to your Phase 3 checkpoint
+python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml
+python -m dreamer.pipeline run --config configs/profiles/production.yaml
 ```
 
-All scripts save checkpoints under `logs/{run_name}/checkpoints/` by default. You can also enable wandb logging by setting `use_wandb=True` in the configs.
+Pipeline stages:
 
-## Experimental Results
-A log of the training process.
+1. `tokenizer`
+2. `dynamics`
+3. `bc_rew`
+4. `policy`
+5. `eval`
+6. `report`
 
-#### MAE training
-The MAE, after training, should have around 40 PSNR, and the visualizations should show perfect reconstruction from masked inputs.
+All runs are saved under `runs/<experiment_name>/<timestamp>/` with:
 
+- `config_resolved.yaml`
+- `manifest.json`
+- `summary.md`
+- stage folders with checkpoints/media
 
-<figure>
-    <img src="docs/step_75900.png">
-  <figcaption>Ground Truth, Masked Input, Reconstructions</figcaption>
-</figure>
+## Run on Colab
 
-#### Dynamics training
-The dynamics model is trained. It should get around ~30 PSNR in the autoregressive generations using diffusion, and ~29 PSNR using shortcut. The generations should look almost pixel perfect.
+Recommended runtime:
 
-<figure>
-    <img src="docs/dynamics_training.png">
-  <figcaption>Dynamics model training curves. </figcaption>
-</figure>
+- GPU runtime enabled
+- High-RAM session when available
+- Persistent Drive mount if you want robust resume across session resets
 
-#### Reward / BC training
-Agent tokens, Reward / BC heads are trained on top of the dynamics model, and the dynamics model is finetuned to prevent collapse.
-<figure>
-    <img src="docs/bc_rew_training.png">
-  <figcaption>Reward / BC / Dynamics model losses. </figcaption>
-</figure>
+Minimal setup sequence:
 
-#### RL in imagination
-The policy is trained with RL on imagination rollouts from the dynamics model.
-<figure>
-    <img src="docs/rl_training.png">
-  <figcaption>RL training curves. The returns increase and the policy stays in the center. </figcaption>
-</figure>
+```bash
+git clone https://github.com/Irayshon/Dreamer4-jax.git
+cd Dreamer4-jax
+pip install uv
+uv sync
+uv pip install -e .
+```
 
+Colab dependency sync (recommended to avoid JAX plugin mismatch):
 
+```bash
+pip uninstall -y jax jaxlib jax-cuda12-plugin jax-cuda12-pjrt
+pip install -r requirements-colab.txt
+```
 
-## References and Acknowledgements
-This implementation references:
-- **Dreamer 4**: [“Training Agents Inside of Scalable World Models”](https://danijar.com/project/dreamer4/)
-- **Jasmine** ["Jasmine: A simple, performant and scalable JAX-based world modeling codebase"](https://github.com/p-doom/jasmine)
+Pipeline commands:
 
-The authors would like to thank Danijar and the Jasmine team (Mihir, Franz, Alfred) for their advice. 
+```bash
+python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml
+python -m dreamer.pipeline run --config configs/profiles/production.yaml
+```
+
+If the session disconnects, resume from an existing run directory:
+
+```bash
+python -m dreamer.pipeline resume --run-dir runs/<experiment_name>/<timestamp>
+```
+
+To quickly validate environment/paths without launching full training:
+
+```bash
+python -m dreamer.pipeline stage-only --config configs/profiles/quick_test.yaml --stage report
+```
+
+Colab notebook template (cell-by-cell):
+
+```python
+# Cell 1: clone + setup
+!git clone https://github.com/Irayshon/Dreamer4-jax.git
+%cd Dreamer4-jax
+!pip install uv
+!uv sync
+!uv pip install -e .
+!pip uninstall -y jax jaxlib jax-cuda12-plugin jax-cuda12-pjrt
+!pip install -r requirements-colab.txt
+```
+
+```python
+# Cell 2: quick smoke check
+!python -m dreamer.pipeline stage-only --config configs/profiles/quick_test.yaml --stage report
+```
+
+```python
+# Cell 3: quick end-to-end run
+!python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml
+```
+
+```python
+# Cell 4: resume an interrupted run
+!python -m dreamer.pipeline resume --run-dir runs/<experiment_name>/<timestamp>
+```
+
+```python
+# Cell 5: production run
+!python -m dreamer.pipeline run --config configs/profiles/production.yaml
+```
+
+## Run on Local Machine
+
+Minimal local setup:
+
+```bash
+uv sync
+uv pip install -e .
+uv pip install "jax[cuda12]"
+```
+
+If you hit JAX/plugin mismatch locally, force the pinned set:
+
+```bash
+pip uninstall -y jax jaxlib jax-cuda12-plugin jax-cuda12-pjrt
+pip install -r requirements-local-gpu.txt
+```
+
+Recommended workflow:
+
+```bash
+python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml
+python -m dreamer.pipeline run --config configs/profiles/production.yaml
+```
+
+Common troubleshooting:
+
+- CUDA/JAX mismatch: reinstall JAX with the CUDA build matching your driver/toolkit.
+- GPU not detected: verify `jax.devices()` includes a CUDA device.
+- Missing `jaxlpips`: run `pip install jaxlpips` or install from `requirements-colab.txt` / `requirements-local-gpu.txt`.
+- OOM: reduce `B`, `T`, or `horizon` in profile YAML (prefer reducing `B` first).
+
+## Estimated Runtime by GPU
+
+Assumptions for estimates:
+
+- single GPU
+- default `quick_test` and `production` profiles
+- no major I/O bottleneck
+- no repeated restarts
+
+Stage share guidance for debugging bottlenecks:
+
+- tokenizer: 15-20%
+- dynamics: 25-30%
+- bc_rew: 20-25%
+- policy: 30-40%
+
+Estimated end-to-end wall-time (tokenizer + dynamics + bc_rew + policy + eval/report):
+
+| GPU | quick_test | production |
+|---|---:|---:|
+| Colab T4 (16GB) | 6-12h | 10-18d |
+| Colab L4 (24GB) | 3-6h | 5-9d |
+| Colab A100 (40GB) | 1.5-3h | 2.5-4.5d |
+| RTX 3060 (12GB) | 7-14h | Not recommended at default config (downscale needed) |
+| RTX 3090 (24GB) | 2.5-5h | 4-7d |
+| RTX 4090 (24GB) | 2-4h | 3.5-6d |
+
+## Cost/Time Notes
+
+- These are end-to-end wall-time ranges, not strict SLA numbers.
+- Actual runtime can vary with driver/JAX version, logging/media I/O, and background load.
+- `production` on Colab typically spans multiple sessions; use `resume` as the default workflow.
+- 12GB-class GPUs may require reduced batch/time settings for `production`.
+
+Primary docs:
+
+- [Architecture](docs/architecture.md)
+- [Pipeline](docs/pipeline.md)
+- [Experiments](docs/experiments.md)
+- [Reproduction Audit](docs/reproduction_audit.md)
+
+## Expected Acceptance Signals
+
+The current acceptance signals are split by path:
+
+- Toy path:
+  - Tokenizer: good masked reconstruction and strong PSNR
+  - Dynamics: accurate autoregressive rollouts and stable shortcut sampling
+  - BC/Reward stage: decreasing action/reward losses and sensible readouts
+  - Policy stage: improved imagined return and real toy-environment return
+
+- Grasping path:
+  - End-to-end batch compatibility through all 4 training stages
+  - Correct action-vocabulary and `task_ids` wiring
+  - Coherent visual predictions across approach / grasp / transport / place phases
+  - Interpretable grasp metrics such as grasp success and placement success
+
+Representative outputs already checked into `docs/`:
+
+- tokenizer reconstruction snapshot: `docs/step_75900.png`
+- dynamics curves: `docs/dynamics_training.png`
+- BC/reward curves: `docs/bc_rew_training.png`
+- policy curves: `docs/rl_training.png`
+- imagination/video demos: `docs/imagination-cropped.gif`, `docs/rl-cropped.gif`
+
+## Honest Positioning
+
+If you use this repo in applications, the safest framing is:
+
+> Implemented and analyzed the core Dreamer4 training pipeline in JAX, validated on a toy visual-control domain and extended toward a robotics-inspired 2.5D grasping benchmark, including MAE tokenizer pretraining, shortcut-forcing dynamics, BC/reward finetuning, and imagination-based RL with PMPO-style updates.
+
+That framing is both strong and accurate.
+
+## References
+
+- Dreamer4: [Training Agents Inside of Scalable World Models](https://danijar.com/project/dreamer4/)
+- Jasmine: [A simple, performant and scalable JAX-based world modeling codebase](https://github.com/p-doom/jasmine)
