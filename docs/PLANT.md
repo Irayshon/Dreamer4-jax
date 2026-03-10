@@ -27,7 +27,14 @@ Regression compatibility path:
   - `configs/env/grasping_2p5d.yaml`
   - `configs/profiles/quick_test.yaml`
   - `configs/profiles/production.yaml`
+  - `configs/profiles/production_policy_recover.yaml`
 - Standard metrics/report surface for policy evaluation
+- Policy eval media + diagnostics:
+  - `policy/viz/real_env_eval_stepXXXXXX.mp4`
+  - `policy/viz/real_env_eval_strip_stepXXXXXX_b*.png`
+  - `policy/viz/real_env_eval_manifest_stepXXXXXX.json`
+  - `policy/metrics.jsonl` with grasp diagnostics (`close/lower/lift`, `grasp_attempt`, `attached_ratio`, `goal_chase_while_unattached`)
+- Video fallback path: if MP4 encoding fails, tiled PNG frames are written and marked in manifest.
 
 ## Operating Rules
 
@@ -38,8 +45,8 @@ Regression compatibility path:
 
 ## Immediate Next Priorities
 
-1. Keep stage runners consistently parameterized by config.
-2. Expand lightweight tests for pipeline resume and stage dependency checks.
-3. Maintain clear and honest docs for quick vs production runs.
-4. Avoid reintroducing script-local hardcoded environment paths.
-5. Keep README Colab cell template aligned with actual CLI/config interface.
+1. Continue policy-stage recovery on existing production runs before restarting full-chain training.
+2. Track acceptance metrics for recovery (`grasp_success_rate >= 0.2`, `place_success_rate >= 0.1`).
+3. Keep eval media enabled in production/recovery profiles to support visual debugging.
+4. Maintain clear docs for resume flow and profile selection (quick/production/recover).
+5. Avoid reintroducing script-local hardcoded environment paths.

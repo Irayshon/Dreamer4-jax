@@ -126,6 +126,9 @@ class RLConfig:
     # eval media toggle
     write_video_every: int = 10_000
     visualize_every: int = 25_000
+    save_eval_media: bool = True
+    eval_media_max_examples: int = -1
+    eval_greedy: bool = True
 
     # RL-specific
     L: int = 2
@@ -144,6 +147,7 @@ class RLConfig:
     imagination_d: float = 1.0 / 4
     alpha: float = 0.5
     beta: float = 0.3
+    bc_anchor_weight: float = 0.0
 
     # Evaluation
     eval_every: int = 50_000
@@ -219,6 +223,48 @@ def _save_real_env_grid_video(
         for t in range(T):
             grid_frame = _tile_frames_grid(frames_np[:, t], ncols=ncols)
             w.append_data(grid_frame)
+
+
+def _save_real_env_grid_frames_fallback(
+    out_dir: Path,
+    frames_b_t_hwc: np.ndarray,
+) -> Path:
+    """Fallback path when MP4 encoding is unavailable: save tiled PNG frames."""
+    frames_np = _to_uint8(frames_b_t_hwc)
+    B, T = frames_np.shape[:2]
+    ncols = min(2, B)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for t in range(T):
+        grid_frame = _tile_frames_grid(frames_np[:, t], ncols=ncols)
+        imageio.imwrite(out_dir / f"frame_{t:04d}.png", grid_frame)
+    return out_dir
+
+
+def _write_eval_media_manifest(
+    manifest_path: Path,
+    *,
+    step: int,
+    eval_episodes: int,
+    metrics_eval: Dict[str, float],
+    video_path: Path | None,
+    strip_paths: list[Path],
+    video_fallback: bool,
+    fallback_dir: Path | None,
+    video_error: str | None,
+) -> None:
+    payload = {
+        "step": int(step),
+        "eval_episodes": int(eval_episodes),
+        "video_path": str(video_path) if video_path is not None else None,
+        "video_fallback": bool(video_fallback),
+        "video_fallback_dir": str(fallback_dir) if fallback_dir is not None else None,
+        "video_error": video_error,
+        "strip_paths": [str(p) for p in strip_paths],
+        "metrics": {k: float(v) for k, v in metrics_eval.items()},
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
 def _save_real_env_strip(
@@ -524,6 +570,13 @@ class EpisodeResult:
     placement_seen: jnp.ndarray  # (B,)
     attach_steps: jnp.ndarray  # (B,)
     final_goal_distance: jnp.ndarray  # (B,)
+    close_count: jnp.ndarray  # (B,)
+    lower_count: jnp.ndarray  # (B,)
+    lift_count: jnp.ndarray  # (B,)
+    near_object_steps: jnp.ndarray  # (B,)
+    grasp_attempt_count: jnp.ndarray  # (B,)
+    attached_ratio: jnp.ndarray  # (B,)
+    goal_chase_while_unattached_steps: jnp.ndarray  # (B,)
 
 
 # ---------------------------
@@ -922,8 +975,6 @@ def sample_action_from_policy(
         actions: (B,) int32
         logits:  (B, A) unnormalized action logits
     """
-    del rng  # currently unused (deterministic eval by default)
-
     h_for_policy = h_t[:, None, :]  # (B, 1, d_model)
     pi_logits = policy_head.apply(
         pi_vars,
@@ -961,6 +1012,7 @@ def sample_action_from_policy(
         "n_spatial",
         "packing_factor",
         "max_context",
+        "eval_greedy",
     ),
 )
 def eval_rollout_real_env(
@@ -982,6 +1034,7 @@ def eval_rollout_real_env(
     n_spatial: int,
     packing_factor: int,
     max_context: int,
+    eval_greedy: bool,
     schedule_step_idx: int,
     k_max: int,
     rng_key: jax.Array,
@@ -1041,8 +1094,23 @@ def eval_rollout_real_env(
             policy_head=policy_head,
             pi_vars=pi_vars,
             rng=policy_rng,
-            greedy=True,
+            greedy=eval_greedy,
         )
+
+        # Diagnostics before env transition.
+        gripper_pos_t = env_state_t["gripper_pos"].astype(jnp.float32)
+        object_pos_t = env_state_t["object_pos"].astype(jnp.float32)
+        dist_to_object_t = jnp.linalg.norm(gripper_pos_t - object_pos_t, axis=-1)
+        pixels_per_step_t = jnp.asarray(env_state_t.get("pixels_per_step", 2), dtype=jnp.float32)
+        near_threshold_t = jnp.maximum(2.0, pixels_per_step_t + 1.0)
+        near_object_t = dist_to_object_t <= near_threshold_t
+        attached_t = jnp.asarray(env_state_t.get("attached", jnp.zeros((B,), dtype=bool)))
+        placed_t = jnp.asarray(env_state_t.get("placed", jnp.zeros((B,), dtype=bool)))
+        at_contact_t = jnp.asarray(env_state_t.get("gripper_height", jnp.zeros((B,), dtype=jnp.int32))) == 0
+        is_close_t = actions_t == 5
+        is_move_t = actions_t <= 3
+        grasp_attempt_t = is_close_t & near_object_t & at_contact_t & (~attached_t) & (~placed_t)
+        goal_chase_while_unattached_t = is_move_t & (~attached_t)
 
         # Environment step.
         env_state_next, obs_next, rewards_next, dones_next = env_step_fn(
@@ -1071,7 +1139,15 @@ def eval_rollout_real_env(
         )[:, -max_context:]
 
         carry_next = (env_state_next, z_ctx_next, actions_ctx_next, rng_t)
-        outputs_t = (obs_next, actions_t, rewards_next)
+        outputs_t = (
+            obs_next,
+            actions_t,
+            rewards_next,
+            near_object_t,
+            grasp_attempt_t,
+            attached_t,
+            goal_chase_while_unattached_t,
+        )
         return carry_next, outputs_t
 
     init_carry = (env_state, z_ctx_init, actions_ctx_init, rng_roll)
@@ -1082,7 +1158,15 @@ def eval_rollout_real_env(
     )
     env_state_final = final_carry[0]
 
-    obs_seq, actions_seq, rewards_seq = outputs
+    (
+        obs_seq,
+        actions_seq,
+        rewards_seq,
+        near_object_seq,
+        grasp_attempt_seq,
+        attached_seq,
+        goal_chase_unattached_seq,
+    ) = outputs
     # obs_seq:     (horizon, B, H, W, C)
     # actions_seq: (horizon, B)
     # rewards_seq: (horizon, B)
@@ -1090,6 +1174,10 @@ def eval_rollout_real_env(
     obs_seq = jnp.transpose(obs_seq, (1, 0, 2, 3, 4))        # (B, horizon, H, W, C)
     actions_seq = jnp.transpose(actions_seq, (1, 0))         # (B, horizon)
     rewards_seq = jnp.transpose(rewards_seq, (1, 0))         # (B, horizon)
+    near_object_seq = jnp.transpose(near_object_seq, (1, 0))  # (B, horizon)
+    grasp_attempt_seq = jnp.transpose(grasp_attempt_seq, (1, 0))  # (B, horizon)
+    attached_seq = jnp.transpose(attached_seq, (1, 0))  # (B, horizon)
+    goal_chase_unattached_seq = jnp.transpose(goal_chase_unattached_seq, (1, 0))  # (B, horizon)
 
     # Prepend initial step (s0, a0, r0) to get full sequences of length horizon+1.
     frames_full = jnp.concatenate([s0[:, None, ...], obs_seq], axis=1)        # (B, H+1, H, W, C)
@@ -1108,6 +1196,16 @@ def eval_rollout_real_env(
         axis=-1,
     )
 
+    close_count = jnp.sum(actions_seq == 5, axis=-1).astype(jnp.float32)
+    lower_count = jnp.sum(actions_seq == 6, axis=-1).astype(jnp.float32)
+    lift_count = jnp.sum(actions_seq == 7, axis=-1).astype(jnp.float32)
+    near_object_steps = jnp.sum(near_object_seq.astype(jnp.float32), axis=-1)
+    grasp_attempt_count = jnp.sum(grasp_attempt_seq.astype(jnp.float32), axis=-1)
+    attached_ratio = jnp.mean(attached_seq.astype(jnp.float32), axis=-1)
+    goal_chase_while_unattached_steps = jnp.sum(
+        goal_chase_unattached_seq.astype(jnp.float32), axis=-1
+    )
+
     return EpisodeResult(
         frames=frames_full,
         actions=actions_full,
@@ -1117,6 +1215,13 @@ def eval_rollout_real_env(
         placement_seen=jnp.asarray(env_state_final.get("placement_seen", jnp.zeros((B,), dtype=bool))),
         attach_steps=jnp.asarray(env_state_final.get("attach_steps", jnp.zeros((B,), dtype=jnp.int32))),
         final_goal_distance=final_goal_distance,
+        close_count=close_count,
+        lower_count=lower_count,
+        lift_count=lift_count,
+        near_object_steps=near_object_steps,
+        grasp_attempt_count=grasp_attempt_count,
+        attached_ratio=attached_ratio,
+        goal_chase_while_unattached_steps=goal_chase_while_unattached_steps,
     )
 
 
@@ -1184,6 +1289,17 @@ def evaluate_policy_real_env(
     num_batches = int(np.ceil(cfg.eval_episodes / batch_size))
 
     all_returns = []
+    all_grasp_seen = []
+    all_place_seen = []
+    all_attach_steps = []
+    all_final_goal_distance = []
+    all_close_count = []
+    all_lower_count = []
+    all_lift_count = []
+    all_near_object_steps = []
+    all_grasp_attempt_count = []
+    all_attached_ratio = []
+    all_goal_chase_unattached_steps = []
     first_result: EpisodeResult | None = None
     eval_rng = rng_key
 
@@ -1209,30 +1325,66 @@ def evaluate_policy_real_env(
             n_spatial=n_spatial,
             packing_factor=cfg.packing_factor,
             max_context=cfg.context_length,
+            eval_greedy=cfg.eval_greedy,
             schedule_step_idx=schedule_step_idx,
             k_max=k_max,
             rng_key=subkey,
         )
 
         all_returns.append(result.returns)
+        all_grasp_seen.append(result.grasp_seen.astype(jnp.float32))
+        all_place_seen.append(result.placement_seen.astype(jnp.float32))
+        all_attach_steps.append(result.attach_steps.astype(jnp.float32))
+        all_final_goal_distance.append(result.final_goal_distance.astype(jnp.float32))
+        all_close_count.append(result.close_count.astype(jnp.float32))
+        all_lower_count.append(result.lower_count.astype(jnp.float32))
+        all_lift_count.append(result.lift_count.astype(jnp.float32))
+        all_near_object_steps.append(result.near_object_steps.astype(jnp.float32))
+        all_grasp_attempt_count.append(result.grasp_attempt_count.astype(jnp.float32))
+        all_attached_ratio.append(result.attached_ratio.astype(jnp.float32))
+        all_goal_chase_unattached_steps.append(
+            result.goal_chase_while_unattached_steps.astype(jnp.float32)
+        )
         if first_result is None:
             first_result = result
 
     all_returns_arr = jnp.concatenate(all_returns, axis=0)[: cfg.eval_episodes]
+    grasp_seen_arr = jnp.concatenate(all_grasp_seen, axis=0)[: cfg.eval_episodes]
+    place_seen_arr = jnp.concatenate(all_place_seen, axis=0)[: cfg.eval_episodes]
+    attach_steps_arr = jnp.concatenate(all_attach_steps, axis=0)[: cfg.eval_episodes]
+    final_goal_distance_arr = jnp.concatenate(all_final_goal_distance, axis=0)[: cfg.eval_episodes]
+    close_count_arr = jnp.concatenate(all_close_count, axis=0)[: cfg.eval_episodes]
+    lower_count_arr = jnp.concatenate(all_lower_count, axis=0)[: cfg.eval_episodes]
+    lift_count_arr = jnp.concatenate(all_lift_count, axis=0)[: cfg.eval_episodes]
+    near_object_steps_arr = jnp.concatenate(all_near_object_steps, axis=0)[: cfg.eval_episodes]
+    grasp_attempt_count_arr = jnp.concatenate(all_grasp_attempt_count, axis=0)[: cfg.eval_episodes]
+    attached_ratio_arr = jnp.concatenate(all_attached_ratio, axis=0)[: cfg.eval_episodes]
+    goal_chase_unattached_steps_arr = (
+        jnp.concatenate(all_goal_chase_unattached_steps, axis=0)[: cfg.eval_episodes]
+    )
 
     metrics: Dict[str, float] = {
         "eval/return_mean": float(jnp.mean(all_returns_arr)),
         "eval/return_std": float(jnp.std(all_returns_arr)),
         "eval/return_min": float(jnp.min(all_returns_arr)),
         "eval/return_max": float(jnp.max(all_returns_arr)),
+        "eval/grasp_success_rate": float(jnp.mean(grasp_seen_arr)),
+        "eval/place_success_rate": float(jnp.mean(place_seen_arr)),
+        "eval/attach_steps_mean": float(jnp.mean(attach_steps_arr)),
+        "eval/final_goal_distance_mean": float(jnp.mean(final_goal_distance_arr)),
+        "eval/close_count_mean": float(jnp.mean(close_count_arr)),
+        "eval/lower_count_mean": float(jnp.mean(lower_count_arr)),
+        "eval/lift_count_mean": float(jnp.mean(lift_count_arr)),
+        "eval/near_object_steps_mean": float(jnp.mean(near_object_steps_arr)),
+        "eval/grasp_attempt_count_mean": float(jnp.mean(grasp_attempt_count_arr)),
+        "eval/attached_ratio_mean": float(jnp.mean(attached_ratio_arr)),
+        "eval/goal_chase_while_unattached_steps_mean": float(
+            jnp.mean(goal_chase_unattached_steps_arr)
+        ),
     }
 
     media: Dict[str, Any] = {}
     if first_result is not None:
-        metrics["eval/grasp_success_rate"] = float(jnp.mean(first_result.grasp_seen.astype(jnp.float32)))
-        metrics["eval/place_success_rate"] = float(jnp.mean(first_result.placement_seen.astype(jnp.float32)))
-        metrics["eval/attach_steps_mean"] = float(jnp.mean(first_result.attach_steps.astype(jnp.float32)))
-        metrics["eval/final_goal_distance_mean"] = float(jnp.mean(first_result.final_goal_distance))
         # Keep a small batch of frames/actions/rewards for later visualization.
         media = {
             "frames": first_result.frames,
@@ -1302,6 +1454,7 @@ def train_step(
     lambda_: float,
     alpha: float,
     beta: float,
+    bc_anchor_weight: float,
     context_length: int,
     patch: int,
     n_spatial: int,
@@ -1517,7 +1670,13 @@ def train_step(
         )  # (B, horizon)
         kl_loss = beta * jnp.mean(kl_per_state)
 
-        pi_loss = loss_negative + loss_positive + kl_loss
+        anchor_ce_per_state = -jnp.sum(
+            jax.lax.stop_gradient(jax.nn.softmax(pi_bc_logits_t0, axis=-1)) * logp_pi,
+            axis=-1,
+        )
+        anchor_loss = bc_anchor_weight * jnp.mean(anchor_ce_per_state)
+
+        pi_loss = loss_negative + loss_positive + kl_loss + anchor_loss
         total_loss = val_loss + pi_loss
 
         aux = {
@@ -1526,6 +1685,7 @@ def train_step(
             "pi_loss_negative": loss_negative,
             "pi_loss_positive": loss_positive,
             "pi_kl_loss": kl_loss,
+            "bc_anchor_loss": anchor_loss,
             "n_positive": n_positive,
             "n_negative": n_negative,
             "mean_advantage": jnp.mean(advantages),
@@ -1660,7 +1820,10 @@ def run(cfg: RLConfig):
             bg_max_color=255 if cfg.diversify_data else 255,
         )
     env_reset_fn = make_env_reset_fn(cfg.env_name, **env_reset_kwargs)
-    env_step_fn = make_env_step_fn(cfg.env_name, height=cfg.H, width=cfg.W, channels=cfg.C)
+    env_step_kwargs = dict(height=cfg.H, width=cfg.W, channels=cfg.C)
+    if env_spec.name != "bouncing_square":
+        env_step_kwargs["pixels_per_step"] = cfg.pixels_per_step
+    env_step_fn = make_env_step_fn(cfg.env_name, **env_step_kwargs)
 
     # Checkpoint manager and optional restore
     mngr = make_manager(
@@ -1756,6 +1919,7 @@ def run(cfg: RLConfig):
             lambda_=cfg.lambda_,
             alpha=cfg.alpha,
             beta=cfg.beta,
+            bc_anchor_weight=cfg.bc_anchor_weight,
             context_length=cfg.context_length,
             patch=patch,
             n_spatial=n_spatial,
@@ -1789,16 +1953,27 @@ def run(cfg: RLConfig):
             )
             latest_eval_metrics = {k: float(v) for k, v in metrics_eval.items()}
             with metrics_jsonl_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps({"step": int(step), **latest_eval_metrics}, ensure_ascii=True) + "\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "stage": "policy_eval",
+                            "step": int(step),
+                            "elapsed_sec": float(time.time() - start_wall),
+                            **latest_eval_metrics,
+                        },
+                        ensure_ascii=True,
+                    )
+                    + "\n"
+                )
 
-            # Optional visualization: write MP4 + strip plots at a lower frequency.
+            # Optional visualization: by default save media on every eval step.
             video_path: Path | None = None
+            fallback_dir: Path | None = None
+            video_fallback = False
+            video_error: str | None = None
             strip0_path: Path | None = None
-            if (
-                cfg.write_video_every > 0
-                and step % cfg.write_video_every == 0
-                and media_eval
-            ):
+            strip_paths: list[Path] = []
+            if cfg.save_eval_media and media_eval:
                 frames = media_eval.get("frames")
                 actions = media_eval.get("actions")
                 rewards = media_eval.get("rewards")
@@ -1812,12 +1987,22 @@ def run(cfg: RLConfig):
                     if frames_np.ndim == 5 and actions_np.ndim == 2 and rewards_np.ndim == 2:
                         B, T = frames_np.shape[:2]
 
-                        # Grid video over all eval episodes.
+                        # Grid video over all eval episodes. Fallback to PNG frames if codec fails.
                         video_path = vis_dir / f"real_env_eval_step{step:06d}.mp4"
-                        _save_real_env_grid_video(video_path, frames_np)
+                        try:
+                            _save_real_env_grid_video(video_path, frames_np)
+                        except Exception as exc:  # pragma: no cover - environment-dependent codec path
+                            video_fallback = True
+                            video_error = str(exc)
+                            fallback_dir = vis_dir / f"real_env_eval_step{step:06d}_frames"
+                            _save_real_env_grid_frames_fallback(fallback_dir, frames_np)
+                            video_path = None
 
-                        # Strip plots for a few episodes.
-                        num_examples = min(cfg.max_eval_examples_to_plot, B)
+                        # Strip plots for eval episodes (or a configured cap).
+                        if cfg.eval_media_max_examples > 0:
+                            num_examples = min(cfg.eval_media_max_examples, B)
+                        else:
+                            num_examples = B
                         for b_idx in range(num_examples):
                             fig_path = (
                                 vis_dir
@@ -1834,6 +2019,20 @@ def run(cfg: RLConfig):
                             )
                             if b_idx == 0:
                                 strip0_path = fig_path
+                            strip_paths.append(fig_path)
+
+                        manifest_path = vis_dir / f"real_env_eval_manifest_step{step:06d}.json"
+                        _write_eval_media_manifest(
+                            manifest_path,
+                            step=step,
+                            eval_episodes=cfg.eval_episodes,
+                            metrics_eval=metrics_eval,
+                            video_path=video_path,
+                            strip_paths=strip_paths,
+                            video_fallback=video_fallback,
+                            fallback_dir=fallback_dir,
+                            video_error=video_error,
+                        )
 
                         print(
                             f"[viz:eval] Saved real-env eval video/strips to {vis_dir}"
@@ -1845,6 +2044,17 @@ def run(cfg: RLConfig):
                     "eval/return_std": metrics_eval["eval/return_std"],
                     "eval/return_min": metrics_eval["eval/return_min"],
                     "eval/return_max": metrics_eval["eval/return_max"],
+                    "eval/grasp_success_rate": metrics_eval["eval/grasp_success_rate"],
+                    "eval/place_success_rate": metrics_eval["eval/place_success_rate"],
+                    "eval/attach_steps_mean": metrics_eval["eval/attach_steps_mean"],
+                    "eval/final_goal_distance_mean": metrics_eval["eval/final_goal_distance_mean"],
+                    "eval/close_count_mean": metrics_eval["eval/close_count_mean"],
+                    "eval/lower_count_mean": metrics_eval["eval/lower_count_mean"],
+                    "eval/lift_count_mean": metrics_eval["eval/lift_count_mean"],
+                    "eval/near_object_steps_mean": metrics_eval["eval/near_object_steps_mean"],
+                    "eval/grasp_attempt_count_mean": metrics_eval["eval/grasp_attempt_count_mean"],
+                    "eval/attached_ratio_mean": metrics_eval["eval/attached_ratio_mean"],
+                    "eval/goal_chase_while_unattached_steps_mean": metrics_eval["eval/goal_chase_while_unattached_steps_mean"],
                 }
 
                 # Attach media if just written this step.
@@ -1863,33 +2073,69 @@ def run(cfg: RLConfig):
 
         if step % cfg.log_every == 0:
             elapsed = time.time() - start_wall
+            val_loss = float(aux["val_loss"])
+            pi_loss = float(aux["pi_loss"])
+            pi_loss_negative = float(aux["pi_loss_negative"])
+            pi_loss_positive = float(aux["pi_loss_positive"])
+            pi_kl_loss = float(aux["pi_kl_loss"])
+            bc_anchor_loss = float(aux["bc_anchor_loss"])
+            mean_advantage = float(aux["mean_advantage"])
+            mean_td_return = float(aux["mean_td_return"])
+            n_positive = int(aux["n_positive"])
+            n_negative = int(aux["n_negative"])
             print(
                 f"[train] step={step:06d} | "
-                f"val_loss={aux['val_loss']:.4f} | "
-                f"pi_loss={aux['pi_loss']:.4f} | "
-                f"pi_neg={aux['pi_loss_negative']:.4f} | "
-                f"pi_pos={aux['pi_loss_positive']:.4f} | "
-                f"pi_kl={aux['pi_kl_loss']:.4f} | "
-                f"mean_adv={aux['mean_advantage']:.4f} | "
-                f"mean_td_return={aux['mean_td_return']:.4f} | "
-                f"n_pos={int(aux['n_positive'])}/"
-                f"{int(aux['n_positive'] + aux['n_negative'])} | "
+                f"val_loss={val_loss:.4f} | "
+                f"pi_loss={pi_loss:.4f} | "
+                f"pi_neg={pi_loss_negative:.4f} | "
+                f"pi_pos={pi_loss_positive:.4f} | "
+                f"pi_kl={pi_kl_loss:.4f} | "
+                f"pi_anchor={bc_anchor_loss:.4f} | "
+                f"mean_adv={mean_advantage:.4f} | "
+                f"mean_td_return={mean_td_return:.4f} | "
+                f"n_pos={n_positive}/"
+                f"{n_positive + n_negative} | "
                 f"train_step_t={(train_step_end - train_step_start):.4f}s"
             )
+            with metrics_jsonl_path.open("a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "stage": "policy",
+                            "step": int(step),
+                            "elapsed_sec": float(elapsed),
+                            "step_time_sec": float(train_step_end - train_step_start),
+                            "loss_total": val_loss,
+                            "val_loss": val_loss,
+                            "pi_loss": pi_loss,
+                            "pi_loss_negative": pi_loss_negative,
+                            "pi_loss_positive": pi_loss_positive,
+                            "pi_kl_loss": pi_kl_loss,
+                            "bc_anchor_loss": bc_anchor_loss,
+                            "mean_advantage": mean_advantage,
+                            "mean_td_return": mean_td_return,
+                            "n_positive": n_positive,
+                            "n_negative": n_negative,
+                        },
+                        ensure_ascii=True,
+                    )
+                    + "\n"
+                )
 
             if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
                 wandb.log(
                     {
                         "step": step,
-                        "val_loss": float(aux["val_loss"]),
-                        "pi_loss": float(aux["pi_loss"]),
-                        "pi_loss_negative": float(aux["pi_loss_negative"]),
-                        "pi_loss_positive": float(aux["pi_loss_positive"]),
-                        "pi_kl_loss": float(aux["pi_kl_loss"]),
-                        "mean_advantage": float(aux["mean_advantage"]),
-                        "mean_td_return": float(aux["mean_td_return"]),
-                        "n_positive": int(aux["n_positive"]),
-                        "n_negative": int(aux["n_negative"]),
+                        "val_loss": val_loss,
+                        "pi_loss": pi_loss,
+                        "pi_loss_negative": pi_loss_negative,
+                        "pi_loss_positive": pi_loss_positive,
+                        "pi_kl_loss": pi_kl_loss,
+                        "bc_anchor_loss": bc_anchor_loss,
+                        "mean_advantage": mean_advantage,
+                        "mean_td_return": mean_td_return,
+                        "n_positive": n_positive,
+                        "n_negative": n_negative,
                     },
                     step=step,
                 )

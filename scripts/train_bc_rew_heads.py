@@ -929,6 +929,7 @@ def run(cfg: RealismConfig):
     run_dir = _ensure_dir(root / cfg.run_name)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
+    metrics_jsonl_path = run_dir / "metrics.jsonl"
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
     # Data iterator (streaming)
@@ -1049,6 +1050,27 @@ def run(cfg: RealismConfig):
                 f"total_t={total_time:.1f}s",
             ]
             print(" | ".join(pieces))
+            with metrics_jsonl_path.open("a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "stage": "bc_rew",
+                            "step": int(step),
+                            "elapsed_sec": float(total_time),
+                            "step_time_sec": float(step_time),
+                            "loss_total": float(w_shortcut + w_pi_ce + w_rw_ce),
+                            "flow_mse": flow_mse,
+                            "bootstrap_mse": boot_mse,
+                            "pi_ce": pi_ce,
+                            "rw_ce": rw_ce,
+                            "w_shortcut": w_shortcut,
+                            "w_pi_ce": w_pi_ce,
+                            "w_rw_ce": w_rw_ce,
+                        },
+                        ensure_ascii=True,
+                    )
+                    + "\n"
+                )
 
             # Log to wandb
             if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:

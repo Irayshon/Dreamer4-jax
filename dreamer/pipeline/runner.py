@@ -9,6 +9,7 @@ from typing import Any
 
 from dreamer.pipeline.config import STAGE_ORDER, compute_paths, dump_yaml, load_config
 from dreamer.pipeline.io import StageRecord, append_jsonl, ensure_dirs, now_iso, read_json, write_json
+from dreamer.pipeline.plots import build_run_dashboard, plot_stage_curves, write_best_checkpoint
 
 
 def _timestamp() -> str:
@@ -40,6 +41,13 @@ def _load_last_metrics(policy_metrics_jsonl: Path) -> dict[str, float]:
         "eval/place_success_rate": float("nan"),
         "eval/attach_steps_mean": float("nan"),
         "eval/final_goal_distance_mean": float("nan"),
+        "eval/close_count_mean": float("nan"),
+        "eval/lower_count_mean": float("nan"),
+        "eval/lift_count_mean": float("nan"),
+        "eval/near_object_steps_mean": float("nan"),
+        "eval/grasp_attempt_count_mean": float("nan"),
+        "eval/attached_ratio_mean": float("nan"),
+        "eval/goal_chase_while_unattached_steps_mean": float("nan"),
     }
     if not policy_metrics_jsonl.exists():
         return defaults
@@ -52,16 +60,92 @@ def _load_last_metrics(policy_metrics_jsonl: Path) -> dict[str, float]:
     if last_line is None:
         return defaults
 
-    loaded = json.loads(last_line)
-    if not isinstance(loaded, dict):
-        return defaults
-
     out = dict(defaults)
-    for key in out:
-        value = loaded.get(key)
-        if value is not None:
-            out[key] = float(value)
+    lines = policy_metrics_jsonl.read_text(encoding="utf-8").splitlines()
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        loaded = json.loads(raw)
+        if not isinstance(loaded, dict):
+            continue
+        found = False
+        for key in out:
+            value = loaded.get(key)
+            if value is not None:
+                out[key] = float(value)
+                found = True
+        if found:
+            return out
     return out
+
+
+def _load_best_checkpoint(run_dir: Path, stage: str) -> dict[str, Any] | None:
+    best_path = run_dir / stage / "best_checkpoint.json"
+    if not best_path.exists():
+        return None
+    loaded = read_json(best_path)
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _write_summary(run_dir: Path, cfg: dict[str, Any], manifest: dict[str, Any]) -> None:
+    env_name = cfg["env_name"]
+    metrics = _load_last_metrics(run_dir / "policy" / "metrics.jsonl")
+    lines = [
+        f"# Experiment Summary: {cfg['experiment_name']}",
+        "",
+        f"- Environment: `{env_name}`",
+        f"- Run directory: `{run_dir}`",
+        "",
+        "## Stage Status",
+        "",
+    ]
+
+    for stage in STAGE_ORDER:
+        record = manifest.get("stages", {}).get(stage)
+        status = "pending" if record is None else str(record.get("status", "unknown"))
+        lines.append(f"- {stage}: {status}")
+
+    lines.extend(
+        [
+            "",
+            "## Final Eval Metrics",
+            "",
+            f"- return_mean: {metrics['eval/return_mean']:.6g}" if not math.isnan(metrics["eval/return_mean"]) else "- return_mean: NaN",
+            f"- return_std: {metrics['eval/return_std']:.6g}" if not math.isnan(metrics["eval/return_std"]) else "- return_std: NaN",
+            f"- grasp_success_rate: {metrics['eval/grasp_success_rate']:.6g}" if not math.isnan(metrics["eval/grasp_success_rate"]) else "- grasp_success_rate: NaN",
+            f"- place_success_rate: {metrics['eval/place_success_rate']:.6g}" if not math.isnan(metrics["eval/place_success_rate"]) else "- place_success_rate: NaN",
+            f"- attach_steps_mean: {metrics['eval/attach_steps_mean']:.6g}" if not math.isnan(metrics["eval/attach_steps_mean"]) else "- attach_steps_mean: NaN",
+            f"- final_goal_distance_mean: {metrics['eval/final_goal_distance_mean']:.6g}" if not math.isnan(metrics["eval/final_goal_distance_mean"]) else "- final_goal_distance_mean: NaN",
+            "",
+            "## Grasp Behavior Diagnostics",
+            "",
+            f"- close_count_mean: {metrics['eval/close_count_mean']:.6g}" if not math.isnan(metrics["eval/close_count_mean"]) else "- close_count_mean: NaN",
+            f"- lower_count_mean: {metrics['eval/lower_count_mean']:.6g}" if not math.isnan(metrics["eval/lower_count_mean"]) else "- lower_count_mean: NaN",
+            f"- lift_count_mean: {metrics['eval/lift_count_mean']:.6g}" if not math.isnan(metrics["eval/lift_count_mean"]) else "- lift_count_mean: NaN",
+            f"- near_object_steps_mean: {metrics['eval/near_object_steps_mean']:.6g}" if not math.isnan(metrics["eval/near_object_steps_mean"]) else "- near_object_steps_mean: NaN",
+            f"- grasp_attempt_count_mean: {metrics['eval/grasp_attempt_count_mean']:.6g}" if not math.isnan(metrics["eval/grasp_attempt_count_mean"]) else "- grasp_attempt_count_mean: NaN",
+            f"- attached_ratio_mean: {metrics['eval/attached_ratio_mean']:.6g}" if not math.isnan(metrics["eval/attached_ratio_mean"]) else "- attached_ratio_mean: NaN",
+            f"- goal_chase_while_unattached_steps_mean: {metrics['eval/goal_chase_while_unattached_steps_mean']:.6g}" if not math.isnan(metrics["eval/goal_chase_while_unattached_steps_mean"]) else "- goal_chase_while_unattached_steps_mean: NaN",
+            "",
+            "## Best Checkpoints",
+            "",
+        ]
+    )
+
+    for stage in ("tokenizer", "dynamics", "bc_rew", "policy"):
+        best = _load_best_checkpoint(run_dir, stage)
+        if best is None:
+            lines.append(f"- {stage}: N/A")
+            continue
+        metric_key = str(best.get("metric_key", "metric"))
+        step = best.get("step", "N/A")
+        value = best.get("value", "N/A")
+        checkpoint_path = best.get("checkpoint_path", "")
+        lines.append(
+            f"- {stage}: {metric_key}={value} at step={step} ({checkpoint_path})"
+        )
+    lines.append("")
+    (run_dir / "summary.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def _build_stage_common(stage_cfg: dict[str, Any], run_dir: Path, stage_name: str, env_name: str, use_wandb: bool) -> dict[str, Any]:
@@ -140,30 +224,19 @@ def _run_stage(stage: str, cfg: dict[str, Any], run_dir: Path, manifest: dict[st
             "place_success_rate": values["eval/place_success_rate"],
             "attach_steps_mean": values["eval/attach_steps_mean"],
             "final_goal_distance_mean": values["eval/final_goal_distance_mean"],
+            "close_count_mean": values["eval/close_count_mean"],
+            "lower_count_mean": values["eval/lower_count_mean"],
+            "lift_count_mean": values["eval/lift_count_mean"],
+            "near_object_steps_mean": values["eval/near_object_steps_mean"],
+            "grasp_attempt_count_mean": values["eval/grasp_attempt_count_mean"],
+            "attached_ratio_mean": values["eval/attached_ratio_mean"],
+            "goal_chase_while_unattached_steps_mean": values["eval/goal_chase_while_unattached_steps_mean"],
         }
         append_jsonl(run_dir / "metrics" / "metrics.jsonl", standardized)
         checkpoint_dir = None
         details = standardized
 
     elif stage == "report":
-        metrics = _load_last_metrics(run_dir / "policy" / "metrics.jsonl")
-        lines = [
-            f"# Experiment Summary: {cfg['experiment_name']}",
-            "",
-            f"- Environment: `{env_name}`",
-            f"- Run directory: `{run_dir}`",
-            "",
-            "## Final Eval Metrics",
-            "",
-            f"- return_mean: {metrics['eval/return_mean']:.6g}" if not math.isnan(metrics["eval/return_mean"]) else "- return_mean: NaN",
-            f"- return_std: {metrics['eval/return_std']:.6g}" if not math.isnan(metrics["eval/return_std"]) else "- return_std: NaN",
-            f"- grasp_success_rate: {metrics['eval/grasp_success_rate']:.6g}" if not math.isnan(metrics["eval/grasp_success_rate"]) else "- grasp_success_rate: NaN",
-            f"- place_success_rate: {metrics['eval/place_success_rate']:.6g}" if not math.isnan(metrics["eval/place_success_rate"]) else "- place_success_rate: NaN",
-            f"- attach_steps_mean: {metrics['eval/attach_steps_mean']:.6g}" if not math.isnan(metrics["eval/attach_steps_mean"]) else "- attach_steps_mean: NaN",
-            f"- final_goal_distance_mean: {metrics['eval/final_goal_distance_mean']:.6g}" if not math.isnan(metrics["eval/final_goal_distance_mean"]) else "- final_goal_distance_mean: NaN",
-            "",
-        ]
-        (run_dir / "summary.md").write_text("\n".join(lines), encoding="utf-8")
         checkpoint_dir = None
         details = {"summary_path": str(run_dir / "summary.md")}
 
@@ -173,9 +246,22 @@ def _run_stage(stage: str, cfg: dict[str, Any], run_dir: Path, manifest: dict[st
     stage_record.status = "completed"
     stage_record.finished_at = now_iso()
     stage_record.checkpoint_dir = str(checkpoint_dir) if checkpoint_dir is not None else None
+    stage_dir = run_dir / stage
+    if stage in {"tokenizer", "dynamics", "bc_rew", "policy"}:
+        curves = plot_stage_curves(stage, stage_dir)
+        if curves:
+            details["curves"] = curves
+        best = write_best_checkpoint(stage, stage_dir, checkpoint_dir)
+        if best is not None:
+            details["best_checkpoint"] = best
     stage_record.details = details
     manifest["stages"][stage] = dataclasses.asdict(stage_record)
     write_json(run_dir / "manifest.json", manifest)
+    _write_summary(run_dir, cfg, manifest)
+    dashboard = build_run_dashboard(run_dir)
+    if dashboard:
+        manifest["dashboard"] = dashboard
+        write_json(run_dir / "manifest.json", manifest)
 
 
 def _create_run_dir(cfg: dict[str, Any]) -> Path:
@@ -183,6 +269,7 @@ def _create_run_dir(cfg: dict[str, Any]) -> Path:
     run_dir = root / cfg["experiment_name"] / _timestamp()
     paths = compute_paths(run_dir)
     ensure_dirs(paths.run_dir, paths.checkpoints_dir, paths.metrics_dir, paths.media_dir)
+    (run_dir / "latest_run.txt").write_text(str(run_dir.resolve()), encoding="utf-8")
     return run_dir
 
 
@@ -192,6 +279,7 @@ def run_pipeline(
     command: str = "run",
     stage_only: str | None = None,
     run_dir: str | Path | None = None,
+    output_root_override: str | None = None,
 ) -> Path:
     if command not in {"run", "resume", "stage-only"}:
         raise ValueError(f"Unsupported command={command!r}")
@@ -200,6 +288,9 @@ def run_pipeline(
         if config_path is None:
             raise ValueError("config_path is required for run/stage-only")
         cfg = load_config(config_path)
+        if output_root_override:
+            cfg = dict(cfg)
+            cfg["output_root"] = output_root_override
         current_run_dir = _create_run_dir(cfg)
         (current_run_dir / "config_resolved.yaml").write_text(dump_yaml(cfg), encoding="utf-8")
         manifest = {
@@ -214,6 +305,7 @@ def run_pipeline(
         if run_dir is None:
             raise ValueError("run_dir is required for resume")
         current_run_dir = Path(run_dir).resolve()
+        (current_run_dir / "latest_run.txt").write_text(str(current_run_dir.resolve()), encoding="utf-8")
         cfg = load_config(current_run_dir / "config_resolved.yaml")
         manifest = read_json(current_run_dir / "manifest.json")
 

@@ -22,6 +22,7 @@ Use the unified pipeline entrypoint, not ad-hoc script execution:
 ```bash
 python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml
 python -m dreamer.pipeline run --config configs/profiles/production.yaml
+python -m dreamer.pipeline run --config configs/profiles/production_policy_recover.yaml
 ```
 
 Supported commands:
@@ -50,6 +51,11 @@ Historical planning docs were moved to `docs/archive/`.
   - `configs/base.yaml`
   - profile overlays in `configs/profiles/`
   - docs that describe run profiles
+- Policy recovery knobs now part of config contract:
+  - `save_eval_media`
+  - `eval_media_max_examples`
+  - `eval_greedy`
+  - `bc_anchor_weight`
 
 ## Artifact Contract
 
@@ -63,6 +69,13 @@ with:
 - `manifest.json`
 - `summary.md`
 - stage outputs and checkpoints
+
+Policy eval must also emit:
+
+- `policy/viz/real_env_eval_stepXXXXXX.mp4` (or fallback frames)
+- `policy/viz/real_env_eval_strip_stepXXXXXX_b*.png`
+- `policy/viz/real_env_eval_manifest_stepXXXXXX.json`
+- diagnostic eval fields in `policy/metrics.jsonl`
 
 Do not break this contract without updating pipeline and docs together.
 
@@ -83,6 +96,7 @@ Usually safe:
 - config profile tuning
 - pipeline metadata/reporting improvements
 - additive tests
+- policy-only resume experiments using existing run dirs
 
 Risky (require extra validation):
 
@@ -90,3 +104,11 @@ Risky (require extra validation):
 - dynamics/imagination target alignment
 - action vocabulary / task ID semantics
 - checkpoint schema changes
+
+## Resume Guidance After Full-Cycle Completion
+
+If a full run (`tokenizer -> ... -> report`) has completed and grasp/place metrics are below target, continue from:
+
+- `resume --stage-only policy`
+
+Do not restart tokenizer/dynamics/bc_rew unless diagnostics show representation/modeling regressions.

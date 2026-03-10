@@ -1,0 +1,18 @@
+includes:
+  - ./production.yaml
+
+experiment_name: dreamer4_grasping_production_policy_recover
+
+stages:
+  policy:
+    # Resume with current checkpoint and increase this as needed.
+    max_steps: 232000
+    eval_every: 2000
+    eval_episodes: 32
+    write_video_every: 2000
+    save_eval_media: true
+    eval_media_max_examples: -1
+    eval_greedy: true
+    beta: 0.8
+    horizon: 24
+    bc_anchor_weight: 0.0

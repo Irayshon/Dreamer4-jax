@@ -214,7 +214,6 @@ def _scripted_policy(
     width: int,
 ) -> jnp.ndarray:
     """Simple goal-directed controller used for offline demonstrations."""
-    del height, width
     gripper_pos = state["gripper_pos"]
     object_pos = state["object_pos"]
     gripper_height = state["gripper_height"]
@@ -222,7 +221,8 @@ def _scripted_policy(
     attached = state["attached"]
     placed = state["placed"]
     task_id = state["task_id"]
-    goal_center = _goal_center_for_id(task_id, state["height"], state["width"])
+    # Use static function args to avoid tracing Python `max`/`min` over state scalars.
+    goal_center = _goal_center_for_id(task_id, height, width)
 
     target_pos = jnp.where(attached[:, None], goal_center, object_pos)
     delta = target_pos - gripper_pos
@@ -451,6 +451,7 @@ def env_step(
     height: int,
     width: int,
     channels: int,
+    pixels_per_step: int = 2,
 ) -> tuple[dict[str, Any], jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Batched environment step."""
     del channels
@@ -459,7 +460,7 @@ def env_step(
         actions,
         height=height,
         width=width,
-        pixels_per_step=int(env_state["pixels_per_step"]),
+        pixels_per_step=pixels_per_step,
     )
     dones = next_state["placed"]
     return next_state, obs_next, rewards, dones
@@ -539,6 +540,13 @@ def make_env_step_fn(
     height: int,
     width: int,
     channels: int,
+    pixels_per_step: int = 2,
 ):
     """Create a partially applied step function for the policy script."""
-    return partial(env_step, height=height, width=width, channels=channels)
+    return partial(
+        env_step,
+        height=height,
+        width=width,
+        channels=channels,
+        pixels_per_step=pixels_per_step,
+    )

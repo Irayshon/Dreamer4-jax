@@ -92,6 +92,7 @@ Use the unified pipeline entrypoint instead of manually editing script `__main__
 ```bash
 python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml
 python -m dreamer.pipeline run --config configs/profiles/production.yaml
+python -m dreamer.pipeline run --config configs/profiles/production_policy_recover.yaml
 ```
 
 Pipeline stages:
@@ -108,7 +109,15 @@ All runs are saved under `runs/<experiment_name>/<timestamp>/` with:
 - `config_resolved.yaml`
 - `manifest.json`
 - `summary.md`
-- stage folders with checkpoints/media
+- stage folders with checkpoints/media/`metrics.jsonl`/`curves/*.png`/`best_checkpoint.json`
+- run-level `metrics/dashboard.png` and `metrics/kpi_table.png`
+
+Policy evaluation media and diagnostics:
+
+- `policy/viz/real_env_eval_stepXXXXXX.mp4`
+- `policy/viz/real_env_eval_strip_stepXXXXXX_b*.png`
+- `policy/viz/real_env_eval_manifest_stepXXXXXX.json`
+- `policy/metrics.jsonl` includes grasp diagnostics (`close_count_mean`, `grasp_attempt_count_mean`, `attached_ratio_mean`, etc.)
 
 ## Run on Colab
 
@@ -138,14 +147,17 @@ pip install -r requirements-colab.txt
 Pipeline commands:
 
 ```bash
-python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml
-python -m dreamer.pipeline run --config configs/profiles/production.yaml
+python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
+python -m dreamer.pipeline run --config configs/profiles/production.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
+python -m dreamer.pipeline run --config configs/profiles/production_policy_recover.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
 ```
+
+With `--output-root` pointing to Drive, checkpoint saves are persisted immediately in the mounted directory.
 
 If the session disconnects, resume from an existing run directory:
 
 ```bash
-python -m dreamer.pipeline resume --run-dir runs/<experiment_name>/<timestamp>
+python -m dreamer.pipeline resume --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp>
 ```
 
 To quickly validate environment/paths without launching full training:
@@ -160,6 +172,8 @@ Colab notebook template (cell-by-cell):
 # Cell 1: clone + setup
 !git clone https://github.com/Irayshon/Dreamer4-jax.git
 %cd Dreamer4-jax
+from google.colab import drive
+drive.mount("/content/drive")
 !pip install uv
 !uv sync
 !uv pip install -e .
@@ -174,17 +188,17 @@ Colab notebook template (cell-by-cell):
 
 ```python
 # Cell 3: quick end-to-end run
-!python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml
+!python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
 ```
 
 ```python
 # Cell 4: resume an interrupted run
-!python -m dreamer.pipeline resume --run-dir runs/<experiment_name>/<timestamp>
+!python -m dreamer.pipeline resume --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp>
 ```
 
 ```python
 # Cell 5: production run
-!python -m dreamer.pipeline run --config configs/profiles/production.yaml
+!python -m dreamer.pipeline run --config configs/profiles/production.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
 ```
 
 ## Run on Local Machine

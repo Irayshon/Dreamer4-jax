@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
@@ -215,6 +216,7 @@ def run(cfg: TokenizerConfig) -> dict[str, float]:
     log_dir.mkdir(parents=True, exist_ok=True)
     run_dir = log_dir / cfg.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    metrics_jsonl_path = run_dir / "metrics.jsonl"
 
     env_spec = get_env_spec(cfg.env_name)
     if env_spec.name == "bouncing_square":
@@ -325,6 +327,7 @@ def run(cfg: TokenizerConfig) -> dict[str, float]:
         "tokenizer/loss_mse": float("nan"),
         "tokenizer/loss_lpips": float("nan"),
     }
+    run_start = time()
     try:
         for step in range(start_step, cfg.max_steps + 1):
             data_start = time()
@@ -361,6 +364,24 @@ def run(cfg: TokenizerConfig) -> dict[str, float]:
                     f"[train] step={step:06d} | total={total_loss:.6f} | rmse={mse_loss**0.5:.6f} | "
                     f"lpips={lpips_loss:.5f} | psnr={psnr:.4f} | t={data_time + train_time:.3f}s"
                 )
+                with metrics_jsonl_path.open("a", encoding="utf-8") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "stage": "tokenizer",
+                                "step": int(step),
+                                "elapsed_sec": float(time() - run_start),
+                                "step_time_sec": float(data_time + train_time),
+                                "loss_total": total_loss,
+                                "loss_mse": mse_loss,
+                                "loss_lpips": lpips_loss,
+                                "rmse": float(mse_loss**0.5),
+                                "psnr": psnr,
+                            },
+                            ensure_ascii=True,
+                        )
+                        + "\n"
+                    )
                 final_metrics["tokenizer/loss_total"] = total_loss
                 final_metrics["tokenizer/loss_mse"] = mse_loss
                 final_metrics["tokenizer/loss_lpips"] = lpips_loss
