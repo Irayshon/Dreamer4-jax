@@ -64,6 +64,10 @@ class TokenizerConfig:
     lr: float = 1e-4
     lpips_weight: float = 0.2
     lpips_frac: float = 0.25
+    foreground_weight_enabled: bool = True
+    foreground_weight_alpha: float = 3.0
+    foreground_rgb_tolerance: float = 0.05
+    foreground_min_patch_ratio: float = 0.02
 
 
 def init_models(rng, encoder, decoder, patch_tokens, B, T, enc_n_latents, enc_d_bottleneck):
@@ -91,11 +95,64 @@ def forward_apply(encoder, decoder, enc_vars, dec_vars, patches_btnd, *, mae_key
     return pred_btnd, mae_info
 
 
-def recon_loss_from_mae(pred_btnd, patches_btnd, mae_mask):
-    masked_pred = jnp.where(mae_mask, pred_btnd, 0.0)
-    masked_target = jnp.where(mae_mask, patches_btnd, 0.0)
-    num = jnp.maximum(mae_mask.sum(), 1)
-    return jnp.sum((masked_pred - masked_target) ** 2) / (num * pred_btnd.shape[-1])
+def _grasping_foreground_palette() -> jnp.ndarray:
+    # Object colors in grasping_env plus placed-object white color.
+    return jnp.asarray(
+        [
+            [56, 87, 205],
+            [214, 97, 74],
+            [95, 168, 113],
+            [150, 100, 198],
+            [245, 245, 245],
+        ],
+        dtype=jnp.float32,
+    ) / 255.0
+
+
+def _foreground_patch_mask_from_frames(
+    frames_bthwc: jnp.ndarray,
+    *,
+    patch: int,
+    rgb_tolerance: float,
+    min_patch_ratio: float,
+) -> jnp.ndarray:
+    """
+    Build a foreground patch mask (B, T, Np) by matching pixel RGB to grasping object colors.
+    """
+    B, T, H, W, _ = frames_bthwc.shape
+    h_p = H // patch
+    w_p = W // patch
+    palette = _grasping_foreground_palette()  # (K, 3)
+
+    color_dist = jnp.linalg.norm(
+        frames_bthwc[..., None, :] - palette[None, None, None, None, :, :],
+        axis=-1,
+    )  # (B, T, H, W, K)
+    pixel_fg = jnp.any(color_dist <= rgb_tolerance, axis=-1)  # (B, T, H, W)
+
+    pixel_fg_patch = pixel_fg.reshape(B, T, h_p, patch, w_p, patch)
+    patch_fg_ratio = jnp.mean(pixel_fg_patch.astype(jnp.float32), axis=(3, 5))  # (B, T, h_p, w_p)
+    patch_fg = patch_fg_ratio >= min_patch_ratio
+    return patch_fg.reshape(B, T, h_p * w_p)
+
+
+def recon_loss_from_mae(
+    pred_btnd: jnp.ndarray,
+    patches_btnd: jnp.ndarray,
+    mae_mask: jnp.ndarray,
+    *,
+    patch_fg_mask_btn: jnp.ndarray | None = None,
+    foreground_alpha: float = 0.0,
+) -> jnp.ndarray:
+    if patch_fg_mask_btn is None:
+        patch_weight = jnp.ones_like(mae_mask, dtype=pred_btnd.dtype)
+    else:
+        fg = patch_fg_mask_btn[..., None].astype(pred_btnd.dtype)
+        patch_weight = 1.0 + foreground_alpha * fg
+    weighted_mask = mae_mask.astype(pred_btnd.dtype) * patch_weight
+    sq = (pred_btnd - patches_btnd) ** 2
+    denom = jnp.maximum(jnp.sum(weighted_mask), 1.0) * pred_btnd.shape[-1]
+    return jnp.sum(sq * weighted_mask) / denom
 
 
 lpips_loss_fn = None
@@ -149,7 +206,21 @@ def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, dro
     }
 
 
-@partial(jax.jit, static_argnames=("encoder", "decoder", "tx", "patch", "H", "W", "C", "lpips_weight", "lpips_frac"))
+@partial(
+    jax.jit,
+    static_argnames=(
+        "encoder",
+        "decoder",
+        "tx",
+        "patch",
+        "H",
+        "W",
+        "C",
+        "lpips_weight",
+        "lpips_frac",
+        "foreground_weight_enabled",
+    ),
+)
 def train_step(
     encoder,
     decoder,
@@ -168,6 +239,10 @@ def train_step(
     step,
     lpips_weight=0.2,
     lpips_frac=1.0,
+    foreground_weight_enabled=True,
+    foreground_weight_alpha=3.0,
+    foreground_rgb_tolerance=0.05,
+    foreground_min_patch_ratio=0.02,
 ):
     patches_btnd = temporal_patchify(batch, patch)
     step_key = jax.random.fold_in(master_key, step)
@@ -187,16 +262,38 @@ def train_step(
         )
         mae_mask, keep_prob = mae_info
         mse = recon_loss_from_mae(pred, patches_btnd, mae_mask)
+        if foreground_weight_enabled:
+            fg_patch_mask_btn = _foreground_patch_mask_from_frames(
+                batch,
+                patch=patch,
+                rgb_tolerance=foreground_rgb_tolerance,
+                min_patch_ratio=foreground_min_patch_ratio,
+            )
+            mse_fg_weighted = recon_loss_from_mae(
+                pred,
+                patches_btnd,
+                mae_mask,
+                patch_fg_mask_btn=fg_patch_mask_btn,
+                foreground_alpha=foreground_weight_alpha,
+            )
+            fg_patch_ratio = jnp.mean(fg_patch_mask_btn.astype(jnp.float32))
+            mse_for_total = mse_fg_weighted
+        else:
+            mse_fg_weighted = mse
+            fg_patch_ratio = jnp.array(0.0, dtype=pred.dtype)
+            mse_for_total = mse
         if lpips_weight > 0.0:
             lpips = lpips_on_mae_recon(pred, patches_btnd, mae_mask, H=H, W=W, C=C, patch=patch, subsample_frac=lpips_frac)
-            total = mse + lpips_weight * lpips
+            total = mse_for_total + lpips_weight * lpips
         else:
             lpips = 0.0
-            total = mse
+            total = mse_for_total
         aux = {
             "loss_total": total,
             "loss_mse": mse,
+            "loss_mse_fg_weighted": mse_fg_weighted,
             "loss_lpips": lpips,
+            "fg_patch_ratio": fg_patch_ratio,
             "keep_prob": keep_prob,
         }
         return total, aux
@@ -219,6 +316,9 @@ def run(cfg: TokenizerConfig) -> dict[str, float]:
     metrics_jsonl_path = run_dir / "metrics.jsonl"
 
     env_spec = get_env_spec(cfg.env_name)
+    foreground_weight_enabled = bool(cfg.foreground_weight_enabled) and (env_spec.name != "bouncing_square")
+    if bool(cfg.foreground_weight_enabled) and (env_spec.name == "bouncing_square"):
+        print("[tokenizer] foreground weighting is auto-disabled for bouncing_square.")
     if env_spec.name == "bouncing_square":
         iterator = make_iterator(
             cfg.env_name,
@@ -325,7 +425,9 @@ def run(cfg: TokenizerConfig) -> dict[str, float]:
     final_metrics = {
         "tokenizer/loss_total": float("nan"),
         "tokenizer/loss_mse": float("nan"),
+        "tokenizer/loss_mse_fg_weighted": float("nan"),
         "tokenizer/loss_lpips": float("nan"),
+        "tokenizer/fg_patch_ratio": float("nan"),
     }
     run_start = time()
     try:
@@ -352,16 +454,23 @@ def run(cfg: TokenizerConfig) -> dict[str, float]:
                 step=step,
                 lpips_weight=cfg.lpips_weight,
                 lpips_frac=cfg.lpips_frac,
+                foreground_weight_enabled=foreground_weight_enabled,
+                foreground_weight_alpha=cfg.foreground_weight_alpha,
+                foreground_rgb_tolerance=cfg.foreground_rgb_tolerance,
+                foreground_min_patch_ratio=cfg.foreground_min_patch_ratio,
             )
             train_time = time() - train_start
 
             if (step % cfg.log_every == 0) or (step == cfg.max_steps):
                 mse_loss = float(aux["loss_mse"])
+                mse_fg_weighted_loss = float(aux["loss_mse_fg_weighted"])
                 lpips_loss = float(aux["loss_lpips"])
+                fg_patch_ratio = float(aux["fg_patch_ratio"])
                 total_loss = float(aux["loss_total"])
                 psnr = float(10 * jnp.log10(1.0 / jnp.maximum(mse_loss, 1e-10)))
                 print(
                     f"[train] step={step:06d} | total={total_loss:.6f} | rmse={mse_loss**0.5:.6f} | "
+                    f"mse_fg={mse_fg_weighted_loss:.6f} | fg_ratio={fg_patch_ratio:.4f} | "
                     f"lpips={lpips_loss:.5f} | psnr={psnr:.4f} | t={data_time + train_time:.3f}s"
                 )
                 with metrics_jsonl_path.open("a", encoding="utf-8") as f:
@@ -374,7 +483,9 @@ def run(cfg: TokenizerConfig) -> dict[str, float]:
                                 "step_time_sec": float(data_time + train_time),
                                 "loss_total": total_loss,
                                 "loss_mse": mse_loss,
+                                "loss_mse_fg_weighted": mse_fg_weighted_loss,
                                 "loss_lpips": lpips_loss,
+                                "fg_patch_ratio": fg_patch_ratio,
                                 "rmse": float(mse_loss**0.5),
                                 "psnr": psnr,
                             },
@@ -384,7 +495,9 @@ def run(cfg: TokenizerConfig) -> dict[str, float]:
                     )
                 final_metrics["tokenizer/loss_total"] = total_loss
                 final_metrics["tokenizer/loss_mse"] = mse_loss
+                final_metrics["tokenizer/loss_mse_fg_weighted"] = mse_fg_weighted_loss
                 final_metrics["tokenizer/loss_lpips"] = lpips_loss
+                final_metrics["tokenizer/fg_patch_ratio"] = fg_patch_ratio
 
             state = make_state(params, opt_state, rng, step)
             maybe_save(mngr, step, state, meta_example)

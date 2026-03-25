@@ -436,7 +436,7 @@ def save_evaluation_video(
     grid_frames: list[np.ndarray],
     output_path: Path,
     tag: str,
-) -> bool:
+) -> tuple[bool, str | None]:
     """
     Save grid frames as an MP4 video file.
 
@@ -452,10 +452,18 @@ def save_evaluation_video(
         with imageio.get_writer(output_path, fps=25, codec="libx264", quality=8) as w:
             for fr in grid_frames:
                 w.append_data(fr)
-        return True
+        return True, None
     except Exception as e:
-        print(f"[eval:{tag}] MP4 write skipped ({e})")
-        return False
+        err = str(e)
+        print(f"[eval:{tag}] MP4 write skipped ({err})")
+        return False, err
+
+
+def _save_evaluation_frames_fallback(grid_frames: list[np.ndarray], output_dir: Path) -> Path:
+    output_dir = _ensure_dir(output_dir)
+    for idx, frame in enumerate(grid_frames):
+        imageio.imwrite(output_dir / f"frame_{idx:04d}.png", frame)
+    return output_dir
 
 def save_evaluation_plan(
     sampler_conf: SamplerConfig,
@@ -661,6 +669,8 @@ def run_evaluation(
     ctx_length = min(32, cfg.T - 1)
     regimes = _eval_regimes_for_realism(cfg, ctx_length=ctx_length)
 
+    step_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+    regime_records: list[dict[str, Any]] = []
     for tag, sampler_conf in regimes:
         sampler_conf.mae_eval_key = train_state.mae_eval_key
         sampler_conf.rng_key = jax.random.PRNGKey(4242)
@@ -690,15 +700,31 @@ def run_evaluation(
             batch_size=cfg.B,
         )
 
-        # Save video and plan
-        tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
-        mp4_path = tag_dir / f"{tag}_grid.mp4"
-        plan_path = tag_dir / f"{tag}_plan.json"
+        # Save video and plan with fallback frames on codec failure.
+        mp4_path = step_dir / f"{tag}_grid.mp4"
+        plan_path = step_dir / f"{tag}_plan.json"
 
-        save_evaluation_video(grid_frames, mp4_path, tag)
+        video_ok, video_error = save_evaluation_video(grid_frames, mp4_path, tag)
+        fallback_dir: Path | None = None
+        if not video_ok:
+            fallback_dir = _save_evaluation_frames_fallback(grid_frames, step_dir / f"{tag}_frames")
         save_evaluation_plan(sampler_conf, step, mse, psnr, plan_path)
 
-        print(f"[eval:{tag}] wrote {mp4_path.name} and {plan_path.name} in {tag_dir}")
+        print(f"[eval:{tag}] wrote {mp4_path.name} and {plan_path.name} in {step_dir}")
+        regime_records.append(
+            {
+                "tag": tag,
+                "horizon": int(HZ),
+                "mse": float(mse),
+                "psnr_db": float(psnr),
+                "eval_sec": float(dt),
+                "video_path": str(mp4_path) if video_ok else None,
+                "video_fallback": bool(not video_ok),
+                "video_fallback_dir": str(fallback_dir) if fallback_dir is not None else None,
+                "video_error": video_error,
+                "plan_path": str(plan_path),
+            }
+        )
 
         # Log to wandb
         if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
@@ -709,10 +735,129 @@ def run_evaluation(
                 f"eval/{tag}/horizon": HZ,
                 f"eval/{tag}/eval_time": dt,
             }, step=step)
-            if grid_frames:
+            if grid_frames and video_ok:
                 wandb.log({
                     f"eval/{tag}/video": wandb.Video(mp4_path, format="mp4"),
                 }, step=step)
+
+    manifest = {
+        "stage": "dynamics",
+        "step": int(step),
+        "cfg_snapshot": asdict(cfg),
+        "regimes": regime_records,
+    }
+    manifest_path = step_dir / "eval_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=True, indent=2), encoding="utf-8")
+    return manifest
+
+
+def _resolve_ckpt_step_and_meta(ckpt_dir: Path, ckpt_step: int | None) -> tuple[int, dict[str, Any]]:
+    meta_mngr = make_manager(str(ckpt_dir), item_names=("meta",))
+    latest = meta_mngr.latest_step()
+    if latest is None:
+        raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
+    target_step = int(latest) if ckpt_step is None else int(ckpt_step)
+    restored = meta_mngr.restore(
+        target_step,
+        args=ocp.args.Composite(meta=ocp.args.JsonRestore()),
+    )
+    meta = restored.meta if hasattr(restored, "meta") else {}
+    return target_step, (meta or {})
+
+
+def _merge_cfg_from_meta(cfg: RealismConfig, meta: dict[str, Any]) -> RealismConfig:
+    meta_cfg = meta.get("cfg", {}) if isinstance(meta, dict) else {}
+    if not isinstance(meta_cfg, dict) or not meta_cfg:
+        return cfg
+    base = asdict(cfg)
+    for key in base:
+        if key in meta_cfg:
+            base[key] = meta_cfg[key]
+    base["run_name"] = cfg.run_name
+    base["log_dir"] = cfg.log_dir
+    base["env_name"] = cfg.env_name
+    base["use_wandb"] = False
+    local_tokenizer_ckpt = Path(cfg.log_dir) / "tokenizer" / "checkpoints"
+    if local_tokenizer_ckpt.exists():
+        base["tokenizer_ckpt"] = str(local_tokenizer_ckpt)
+    return RealismConfig(**base)
+
+
+def visualize_from_checkpoint(cfg: RealismConfig, *, ckpt_step: int | None = None) -> dict[str, Any]:
+    """
+    Re-generate dynamics visualization artifacts from an existing checkpoint without training.
+    """
+    env_spec = get_env_spec(cfg.env_name)
+    cfg = RealismConfig(**{**asdict(cfg), "action_dim": env_spec.action_dim, "use_wandb": False})
+
+    run_dir = _ensure_dir(Path(cfg.log_dir) / cfg.run_name)
+    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
+    vis_dir = _ensure_dir(run_dir / "viz")
+
+    target_step, ckpt_meta = _resolve_ckpt_step_and_meta(ckpt_dir, ckpt_step)
+    cfg = _merge_cfg_from_meta(cfg, ckpt_meta)
+    env_spec = get_env_spec(cfg.env_name)
+    cfg = RealismConfig(**{**asdict(cfg), "action_dim": env_spec.action_dim, "use_wandb": False})
+
+    iterator_kwargs = dict(pixels_per_step=cfg.pixels_per_step)
+    if env_spec.name == "bouncing_square":
+        iterator_kwargs.update(
+            size_min=cfg.size_min,
+            size_max=cfg.size_max,
+            hold_min=cfg.hold_min,
+            hold_max=cfg.hold_max,
+            fg_min_color=0 if cfg.diversify_data else 128,
+            fg_max_color=255 if cfg.diversify_data else 128,
+            bg_min_color=0 if cfg.diversify_data else 255,
+            bg_max_color=255 if cfg.diversify_data else 255,
+        )
+    next_batch = make_iterator(
+        cfg.env_name,
+        cfg.B,
+        cfg.T,
+        cfg.H,
+        cfg.W,
+        cfg.C,
+        **iterator_kwargs,
+    )
+
+    init_rng = jax.random.PRNGKey(0)
+    _, batch_init = next_batch(init_rng)
+    frames_init, actions_init, _, _ = unpack_batch(batch_init, batch_size=cfg.B)
+    train_state = initialize_models_and_tokenizer(cfg, frames_init, actions_init)
+
+    state_example = make_state(train_state.params, train_state.opt_state, jax.random.PRNGKey(0), step=0)
+    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)
+    mngr = make_manager(str(ckpt_dir), item_names=("state", "meta"))
+    restored = mngr.restore(
+        target_step,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardRestore(abstract_state),
+            meta=ocp.args.JsonRestore(),
+        ),
+    )
+    train_state.params = restored.state["params"]
+    train_state.opt_state = restored.state["opt_state"]
+    train_state.dyn_vars = with_params(train_state.dyn_vars, train_state.params)
+
+    eval_manifest = run_evaluation(
+        cfg=cfg,
+        step=target_step,
+        train_state=train_state,
+        next_batch=next_batch,
+        vis_dir=vis_dir,
+    )
+    posthoc_manifest = {
+        "stage": "dynamics",
+        "posthoc": True,
+        "checkpoint_step": int(target_step),
+        "checkpoint_dir": str(ckpt_dir),
+        "cfg_snapshot": asdict(cfg),
+        "eval_manifest": eval_manifest,
+    }
+    out_path = vis_dir / f"posthoc_manifest_step{target_step:06d}.json"
+    out_path.write_text(json.dumps(posthoc_manifest, ensure_ascii=True, indent=2), encoding="utf-8")
+    return posthoc_manifest
 
 # ---------------------------
 # Main

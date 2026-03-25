@@ -226,3 +226,6 @@ runs/
 __pycache__/
 *.pyc
 .tmp_tests/
+
+# Generated visual artifacts
+docs/results/

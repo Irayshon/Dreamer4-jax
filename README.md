@@ -95,6 +95,14 @@ python -m dreamer.pipeline run --config configs/profiles/production.yaml
 python -m dreamer.pipeline run --config configs/profiles/production_policy_recover.yaml
 ```
 
+Posthoc visualization (no retraining):
+
+```bash
+python -m dreamer.pipeline visualize --run-dir runs/<experiment>/<timestamp> --stage dynamics --ckpt latest
+python -m dreamer.pipeline visualize --run-dir runs/<experiment>/<timestamp> --stage bc_rew --ckpt latest
+python -m dreamer.pipeline visualize --run-dir runs/<experiment>/<timestamp> --stage policy --ckpt latest
+```
+
 Pipeline stages:
 
 1. `tokenizer`
@@ -118,6 +126,24 @@ Policy evaluation media and diagnostics:
 - `policy/viz/real_env_eval_strip_stepXXXXXX_b*.png`
 - `policy/viz/real_env_eval_manifest_stepXXXXXX.json`
 - `policy/metrics.jsonl` includes grasp diagnostics (`close_count_mean`, `grasp_attempt_count_mean`, `attached_ratio_mean`, etc.)
+
+Dynamics/BC-reward visualization artifacts:
+
+- `dynamics/viz/step_XXXXXX/<tag>_grid.mp4` and `dynamics/viz/step_XXXXXX/eval_manifest.json`
+- `bc_rew/viz/step_XXXXXX/<tag>_grid.mp4` and `bc_rew/viz/step_XXXXXX/eval_manifest.json`
+- if MP4 codec is unavailable, fallback PNG frame folders are written and recorded in the manifest
+
+Tokenizer foreground modeling knobs (`configs/base.yaml -> stages.tokenizer`):
+
+- `foreground_weight_enabled`
+- `foreground_weight_alpha`
+- `foreground_rgb_tolerance`
+- `foreground_min_patch_ratio`
+
+Training logs now include:
+
+- `tokenizer/loss_mse_fg_weighted`
+- `tokenizer/fg_patch_ratio`
 
 ## Run on Colab
 
@@ -150,6 +176,9 @@ Pipeline commands:
 python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
 python -m dreamer.pipeline run --config configs/profiles/production.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
 python -m dreamer.pipeline run --config configs/profiles/production_policy_recover.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
+python -m dreamer.pipeline visualize --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp> --stage dynamics --ckpt latest
+python -m dreamer.pipeline visualize --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp> --stage bc_rew --ckpt latest
+python -m dreamer.pipeline visualize --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp> --stage policy --ckpt latest
 ```
 
 With `--output-root` pointing to Drive, checkpoint saves are persisted immediately in the mounted directory.
@@ -201,6 +230,13 @@ drive.mount("/content/drive")
 !python -m dreamer.pipeline run --config configs/profiles/production.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
 ```
 
+```python
+# Cell 6: posthoc visualization from existing checkpoints
+!python -m dreamer.pipeline visualize --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp> --stage dynamics --ckpt latest
+!python -m dreamer.pipeline visualize --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp> --stage bc_rew --ckpt latest
+!python -m dreamer.pipeline visualize --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp> --stage policy --ckpt latest
+```
+
 ## Run on Local Machine
 
 Minimal local setup:
@@ -231,6 +267,9 @@ Common troubleshooting:
 - GPU not detected: verify `jax.devices()` includes a CUDA device.
 - Missing `jaxlpips`: run `pip install jaxlpips` or install from `requirements-colab.txt` / `requirements-local-gpu.txt`.
 - OOM: reduce `B`, `T`, or `horizon` in profile YAML (prefer reducing `B` first).
+- `make_iterator() missing ... channels` or tuple-unpack mismatches: use `python -m dreamer.pipeline visualize ...` instead of old ad-hoc eval scripts; pipeline path uses current `dreamer.envs.make_iterator` + `unpack_batch`.
+- `Dynamics.__init__() got unexpected keyword argument 'action_dim'`: do not instantiate `Dynamics` manually with stale kwargs; current code uses `n_actions=action_dim+1`.
+- Orbax shape mismatch (for example `Requested shape ... stored shape ...`): run posthoc visualization from the original run directory so stage metadata (`meta.cfg`) drives the restore shape.
 
 ## Estimated Runtime by GPU
 

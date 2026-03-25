@@ -252,6 +252,7 @@ def _write_eval_media_manifest(
     video_fallback: bool,
     fallback_dir: Path | None,
     video_error: str | None,
+    cfg_snapshot: Dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "step": int(step),
@@ -262,6 +263,7 @@ def _write_eval_media_manifest(
         "video_error": video_error,
         "strip_paths": [str(p) for p in strip_paths],
         "metrics": {k: float(v) for k, v in metrics_eval.items()},
+        "cfg_snapshot": cfg_snapshot or {},
     }
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -343,6 +345,92 @@ def _save_real_env_strip(
 
     fig.savefig(fig_path, dpi=140)
     plt.close(fig)
+
+
+def _save_policy_eval_media(
+    cfg: RLConfig,
+    *,
+    vis_dir: Path,
+    step: int,
+    metrics_eval: Dict[str, float],
+    media_eval: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """
+    Save policy real-env evaluation artifacts and return a manifest-style summary.
+    """
+    video_path: Path | None = None
+    fallback_dir: Path | None = None
+    video_fallback = False
+    video_error: str | None = None
+    strip0_path: Path | None = None
+    strip_paths: list[Path] = []
+    manifest_path: Path | None = None
+
+    if cfg.save_eval_media and media_eval:
+        frames = media_eval.get("frames")
+        actions = media_eval.get("actions")
+        rewards = media_eval.get("rewards")
+
+        if frames is not None and actions is not None and rewards is not None:
+            frames_np = np.asarray(frames)
+            actions_np = np.asarray(actions)
+            rewards_np = np.asarray(rewards)
+
+            if frames_np.ndim == 5 and actions_np.ndim == 2 and rewards_np.ndim == 2:
+                B, _ = frames_np.shape[:2]
+                video_path = vis_dir / f"real_env_eval_step{step:06d}.mp4"
+                try:
+                    _save_real_env_grid_video(video_path, frames_np)
+                except Exception as exc:  # pragma: no cover - codec availability is environment-dependent
+                    video_fallback = True
+                    video_error = str(exc)
+                    fallback_dir = vis_dir / f"real_env_eval_step{step:06d}_frames"
+                    _save_real_env_grid_frames_fallback(fallback_dir, frames_np)
+                    video_path = None
+
+                if cfg.eval_media_max_examples > 0:
+                    num_examples = min(cfg.eval_media_max_examples, B)
+                else:
+                    num_examples = B
+                for b_idx in range(num_examples):
+                    fig_path = vis_dir / f"real_env_eval_strip_step{step:06d}_b{b_idx}.png"
+                    _save_real_env_strip(
+                        fig_path,
+                        frames_np,
+                        actions_np,
+                        rewards_np,
+                        title=f"Real Env Eval (step={step}, b={b_idx})",
+                        b_index=b_idx,
+                        max_steps=cfg.eval_horizon,
+                    )
+                    if b_idx == 0:
+                        strip0_path = fig_path
+                    strip_paths.append(fig_path)
+
+                manifest_path = vis_dir / f"real_env_eval_manifest_step{step:06d}.json"
+                _write_eval_media_manifest(
+                    manifest_path,
+                    step=step,
+                    eval_episodes=cfg.eval_episodes,
+                    metrics_eval=metrics_eval,
+                    video_path=video_path,
+                    strip_paths=strip_paths,
+                    video_fallback=video_fallback,
+                    fallback_dir=fallback_dir,
+                    video_error=video_error,
+                    cfg_snapshot=asdict(cfg),
+                )
+                print(f"[viz:eval] Saved real-env eval video/strips to {vis_dir}")
+
+    return {
+        "video_path": str(video_path) if video_path is not None else None,
+        "video_fallback": bool(video_fallback),
+        "video_fallback_dir": str(fallback_dir) if fallback_dir is not None else None,
+        "video_error": video_error,
+        "strip0_path": str(strip0_path) if strip0_path is not None else None,
+        "strip_paths": [str(p) for p in strip_paths],
+        "manifest_path": str(manifest_path) if manifest_path is not None else None,
+    }
 
 
 @partial(
@@ -1397,6 +1485,175 @@ def evaluate_policy_real_env(
     return metrics, media, eval_rng
 
 
+def _resolve_ckpt_step_and_meta(ckpt_dir: Path, ckpt_step: int | None) -> tuple[int, dict[str, Any]]:
+    meta_mngr = make_manager(str(ckpt_dir), item_names=("meta",))
+    latest = meta_mngr.latest_step()
+    if latest is None:
+        raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
+    target_step = int(latest) if ckpt_step is None else int(ckpt_step)
+    restored = meta_mngr.restore(
+        target_step,
+        args=ocp.args.Composite(meta=ocp.args.JsonRestore()),
+    )
+    meta = restored.meta if hasattr(restored, "meta") else {}
+    return target_step, (meta or {})
+
+
+def _merge_cfg_from_meta(cfg: RLConfig, meta: dict[str, Any]) -> RLConfig:
+    meta_cfg = meta.get("cfg", {}) if isinstance(meta, dict) else {}
+    if not isinstance(meta_cfg, dict) or not meta_cfg:
+        return cfg
+    base = asdict(cfg)
+    for key in base:
+        if key in meta_cfg:
+            base[key] = meta_cfg[key]
+    base["run_name"] = cfg.run_name
+    base["log_dir"] = cfg.log_dir
+    base["env_name"] = cfg.env_name
+    base["use_wandb"] = False
+
+    local_bc_ckpt = Path(cfg.log_dir) / "bc_rew" / "checkpoints"
+    if local_bc_ckpt.exists():
+        base["bc_rew_ckpt"] = str(local_bc_ckpt)
+    return RLConfig(**base)
+
+
+def visualize_from_checkpoint(cfg: RLConfig, *, ckpt_step: int | None = None) -> dict[str, Any]:
+    """
+    Re-generate policy real-env evaluation media from an existing policy checkpoint.
+    """
+    env_spec = get_env_spec(cfg.env_name)
+    cfg = RLConfig(
+        **{
+            **asdict(cfg),
+            "action_dim": env_spec.action_dim,
+            "n_tasks": max(cfg.n_tasks, env_spec.n_tasks),
+            "use_wandb": False,
+        }
+    )
+
+    run_dir = _ensure_dir(Path(cfg.log_dir) / cfg.run_name)
+    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
+    vis_dir = _ensure_dir(run_dir / "viz")
+
+    target_step, ckpt_meta = _resolve_ckpt_step_and_meta(ckpt_dir, ckpt_step)
+    cfg = _merge_cfg_from_meta(cfg, ckpt_meta)
+    env_spec = get_env_spec(cfg.env_name)
+    cfg = RLConfig(
+        **{
+            **asdict(cfg),
+            "action_dim": env_spec.action_dim,
+            "n_tasks": max(cfg.n_tasks, env_spec.n_tasks),
+            "use_wandb": False,
+        }
+    )
+
+    iterator_kwargs = dict(pixels_per_step=cfg.pixels_per_step)
+    if env_spec.name == "bouncing_square":
+        iterator_kwargs.update(
+            size_min=cfg.size_min,
+            size_max=cfg.size_max,
+            hold_min=cfg.hold_min,
+            hold_max=cfg.hold_max,
+            fg_min_color=0 if cfg.diversify_data else 128,
+            fg_max_color=255 if cfg.diversify_data else 128,
+            bg_min_color=0 if cfg.diversify_data else 255,
+            bg_max_color=255 if cfg.diversify_data else 255,
+        )
+    next_batch = make_iterator(
+        cfg.env_name,
+        cfg.B,
+        cfg.T,
+        cfg.H,
+        cfg.W,
+        cfg.C,
+        **iterator_kwargs,
+    )
+
+    init_rng = jax.random.PRNGKey(0)
+    _, batch_init = next_batch(init_rng)
+    frames_init, actions_init, _, _ = unpack_batch(batch_init, batch_size=cfg.B)
+    train_state = initialize_models(cfg, frames_init, actions_init)
+
+    state_example = make_state(train_state.params, train_state.opt_state, jax.random.PRNGKey(0), step=0)
+    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)
+    mngr = make_manager(str(ckpt_dir), item_names=("state", "meta"))
+    restored = mngr.restore(
+        target_step,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardRestore(abstract_state),
+            meta=ocp.args.JsonRestore(),
+        ),
+    )
+    train_state.params = restored.state["params"]
+    train_state.opt_state = restored.state["opt_state"]
+    train_state.pi_vars = {**train_state.pi_vars, "params": train_state.params["pi"]}
+    train_state.val_vars = {**train_state.val_vars, "params": train_state.params["val"]}
+
+    imag_cfg = ImaginationConfig(
+        k_max=cfg.k_max,
+        horizon=cfg.horizon,
+        context_length=cfg.context_length,
+        n_spatial=cfg.enc_n_latents // cfg.packing_factor,
+        d=cfg.imagination_d,
+        start_mode="pure",
+        tau0_fixed=0.0,
+        match_ctx_tau=False,
+    )
+    schedule = _build_static_schedule(imag_cfg)
+
+    env_reset_kwargs = dict(
+        batch_size=cfg.eval_batch_size,
+        height=cfg.H,
+        width=cfg.W,
+        channels=cfg.C,
+        pixels_per_step=cfg.pixels_per_step,
+    )
+    if env_spec.name == "bouncing_square":
+        env_reset_kwargs.update(
+            size_min=cfg.size_min,
+            size_max=cfg.size_max,
+            fg_min_color=0 if cfg.diversify_data else 128,
+            fg_max_color=255 if cfg.diversify_data else 128,
+            bg_min_color=0 if cfg.diversify_data else 255,
+            bg_max_color=255 if cfg.diversify_data else 255,
+        )
+    env_reset_fn = make_env_reset_fn(cfg.env_name, **env_reset_kwargs)
+    env_step_kwargs = dict(height=cfg.H, width=cfg.W, channels=cfg.C)
+    if env_spec.name != "bouncing_square":
+        env_step_kwargs["pixels_per_step"] = cfg.pixels_per_step
+    env_step_fn = make_env_step_fn(cfg.env_name, **env_step_kwargs)
+
+    metrics_eval, media_eval, _ = evaluate_policy_real_env(
+        train_state,
+        cfg,
+        env_reset_fn,
+        env_step_fn,
+        schedule_step_idx=schedule.step_idx,
+        k_max=cfg.k_max,
+        rng_key=jax.random.PRNGKey(98765),
+    )
+    media_summary = _save_policy_eval_media(
+        cfg,
+        vis_dir=vis_dir,
+        step=target_step,
+        metrics_eval=metrics_eval,
+        media_eval=media_eval,
+    )
+    posthoc_manifest = {
+        "stage": "policy",
+        "posthoc": True,
+        "checkpoint_step": int(target_step),
+        "checkpoint_dir": str(ckpt_dir),
+        "cfg_snapshot": asdict(cfg),
+        "metrics": {k: float(v) for k, v in metrics_eval.items()},
+        "media": media_summary,
+    }
+    out_path = vis_dir / f"posthoc_manifest_step{target_step:06d}.json"
+    out_path.write_text(json.dumps(posthoc_manifest, ensure_ascii=True, indent=2), encoding="utf-8")
+    return posthoc_manifest
+
+
 # ---------------------------
 # JITted training step (imagination + TD-λ + PMPO)
 # ---------------------------
@@ -1966,77 +2223,15 @@ def run(cfg: RLConfig):
                     + "\n"
                 )
 
-            # Optional visualization: by default save media on every eval step.
-            video_path: Path | None = None
-            fallback_dir: Path | None = None
-            video_fallback = False
-            video_error: str | None = None
-            strip0_path: Path | None = None
-            strip_paths: list[Path] = []
-            if cfg.save_eval_media and media_eval:
-                frames = media_eval.get("frames")
-                actions = media_eval.get("actions")
-                rewards = media_eval.get("rewards")
-
-                if frames is not None and actions is not None and rewards is not None:
-                    frames_np = np.asarray(frames)
-                    actions_np = np.asarray(actions)
-                    rewards_np = np.asarray(rewards)
-
-                    # Defensive shape checks.
-                    if frames_np.ndim == 5 and actions_np.ndim == 2 and rewards_np.ndim == 2:
-                        B, T = frames_np.shape[:2]
-
-                        # Grid video over all eval episodes. Fallback to PNG frames if codec fails.
-                        video_path = vis_dir / f"real_env_eval_step{step:06d}.mp4"
-                        try:
-                            _save_real_env_grid_video(video_path, frames_np)
-                        except Exception as exc:  # pragma: no cover - environment-dependent codec path
-                            video_fallback = True
-                            video_error = str(exc)
-                            fallback_dir = vis_dir / f"real_env_eval_step{step:06d}_frames"
-                            _save_real_env_grid_frames_fallback(fallback_dir, frames_np)
-                            video_path = None
-
-                        # Strip plots for eval episodes (or a configured cap).
-                        if cfg.eval_media_max_examples > 0:
-                            num_examples = min(cfg.eval_media_max_examples, B)
-                        else:
-                            num_examples = B
-                        for b_idx in range(num_examples):
-                            fig_path = (
-                                vis_dir
-                                / f"real_env_eval_strip_step{step:06d}_b{b_idx}.png"
-                            )
-                            _save_real_env_strip(
-                                fig_path,
-                                frames_np,
-                                actions_np,
-                                rewards_np,
-                                title=f"Real Env Eval (step={step}, b={b_idx})",
-                                b_index=b_idx,
-                                max_steps=cfg.eval_horizon,
-                            )
-                            if b_idx == 0:
-                                strip0_path = fig_path
-                            strip_paths.append(fig_path)
-
-                        manifest_path = vis_dir / f"real_env_eval_manifest_step{step:06d}.json"
-                        _write_eval_media_manifest(
-                            manifest_path,
-                            step=step,
-                            eval_episodes=cfg.eval_episodes,
-                            metrics_eval=metrics_eval,
-                            video_path=video_path,
-                            strip_paths=strip_paths,
-                            video_fallback=video_fallback,
-                            fallback_dir=fallback_dir,
-                            video_error=video_error,
-                        )
-
-                        print(
-                            f"[viz:eval] Saved real-env eval video/strips to {vis_dir}"
-                        )
+            media_summary = _save_policy_eval_media(
+                cfg,
+                vis_dir=vis_dir,
+                step=step,
+                metrics_eval=metrics_eval,
+                media_eval=media_eval,
+            )
+            video_path = Path(media_summary["video_path"]) if media_summary["video_path"] is not None else None
+            strip0_path = Path(media_summary["strip0_path"]) if media_summary["strip0_path"] is not None else None
 
             if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
                 log_payload: Dict[str, Any] = {

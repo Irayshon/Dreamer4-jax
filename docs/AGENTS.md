@@ -30,6 +30,7 @@ Supported commands:
 - `run`
 - `resume`
 - `stage-only`
+- `visualize`
 
 ## Source of Truth
 
@@ -56,6 +57,13 @@ Historical planning docs were moved to `docs/archive/`.
   - `eval_media_max_examples`
   - `eval_greedy`
   - `bc_anchor_weight`
+- Tokenizer foreground-modeling knobs now part of config contract:
+  - `foreground_weight_enabled`
+  - `foreground_weight_alpha`
+  - `foreground_rgb_tolerance`
+  - `foreground_min_patch_ratio`
+- `grasping_2p5d` is the primary path for foreground-weighted tokenizer loss; `bouncing_square` keeps this path disabled by default behavior.
+- For any posthoc evaluation/visualization, restore model shapes from checkpoint metadata first (`meta.cfg`, kwargs in meta), then overlay run-local paths. Do not hardcode `action_dim`, `n_tasks`, or old iterator signatures.
 
 ## Artifact Contract
 
@@ -76,8 +84,29 @@ Policy eval must also emit:
 - `policy/viz/real_env_eval_strip_stepXXXXXX_b*.png`
 - `policy/viz/real_env_eval_manifest_stepXXXXXX.json`
 - diagnostic eval fields in `policy/metrics.jsonl`
+- `dynamics`/`bc_rew` eval must emit per-step manifests under:
+  - `dynamics/viz/step_XXXXXX/eval_manifest.json`
+  - `bc_rew/viz/step_XXXXXX/eval_manifest.json`
+  - include fallback frame directory when MP4 encoding is unavailable
 
 Do not break this contract without updating pipeline and docs together.
+
+## Visualization Workflow
+
+Training-time media:
+
+- controlled by `write_video_every` (`dynamics`, `bc_rew`, `policy`)
+- policy strips/video controlled by `save_eval_media`
+
+Posthoc media (without retraining):
+
+```bash
+python -m dreamer.pipeline visualize --run-dir <run_dir> --stage dynamics --ckpt latest
+python -m dreamer.pipeline visualize --run-dir <run_dir> --stage bc_rew --ckpt latest
+python -m dreamer.pipeline visualize --run-dir <run_dir> --stage policy --ckpt latest
+```
+
+`--ckpt` can be `latest` or an integer step.
 
 ## Change Priorities
 

@@ -41,6 +41,21 @@ HEIGHT_HOVER = jnp.int32(1)
 HEIGHT_LIFTED = jnp.int32(2)
 MAX_HEIGHT = HEIGHT_LIFTED
 
+def _goal_bin_radius(height: int, width: int) -> int:
+    return max(3, min(height, width) // 10)
+
+
+def _goal_bin_side_px(height: int, width: int) -> int:
+    return 2 * _goal_bin_radius(height, width) + 1
+
+
+def _object_size_px(height: int, width: int) -> int:
+    # Requested by user: object area = one third of a corner-bin square area.
+    # Bin area = bin_side^2, so object side = sqrt(bin_area / 3).
+    bin_side = _goal_bin_side_px(height, width)
+    object_side = int(round((float(bin_side * bin_side) / 3.0) ** 0.5))
+    return max(2, object_side)
+
 
 def _goal_centers(height: int, width: int) -> jnp.ndarray:
     margin_y = max(5, height // 6)
@@ -138,7 +153,7 @@ def _render_observation(
     )
 
     # Paint all bins as light context, then highlight the active target.
-    goal_mins, goal_maxs = _goal_rects(height, width, radius=max(3, min(height, width) // 10))
+    goal_mins, goal_maxs = _goal_rects(height, width, radius=_goal_bin_radius(height, width))
     bin_bg = ((bin_palette.astype(jnp.float32) + 255.0) / 2.0).astype(jnp.uint8)
     for goal_idx in range(NUM_TASKS):
         table = _paint_rect(
@@ -151,7 +166,8 @@ def _render_observation(
     table = _paint_rect(table, goal_mins[task_id], goal_maxs[task_id], active_bin_color)
 
     # Paint the object.
-    object_size = jnp.full((B,), max(2, min(height, width) // 10), dtype=jnp.int32)
+    object_size_px = _object_size_px(height, width)
+    object_size = jnp.full((B,), object_size_px, dtype=jnp.int32)
     object_half = object_size // 2
     obj_color = object_palette[object_color_id % object_palette.shape[0]]
     obj_top_left = jnp.maximum(object_pos - object_half[:, None], 0)
@@ -316,7 +332,8 @@ def _transition(
 
     goal_center = _goal_center_for_id(task_id, height, width)
     object_pos_next = jnp.where(place_success[:, None], goal_center, object_pos_after_attach)
-    object_pos_next = _clip_pos(object_pos_next, height, width, margin=3)
+    object_margin = max(3, _object_size_px(height, width) // 2 + 1)
+    object_pos_next = _clip_pos(object_pos_next, height, width, margin=object_margin)
 
     dist_to_object_after = jnp.linalg.norm(
         gripper_pos_after_move.astype(jnp.float32) - object_pos_next.astype(jnp.float32),
@@ -394,7 +411,7 @@ def env_reset(
     """Batched environment reset."""
     del channels
     k_task, k_obj, k_grip, k_color = jax.random.split(key, 4)
-    object_margin = max(8, min(height, width) // 4)
+    object_margin = max(8, min(height, width) // 4, _object_size_px(height, width) // 2 + 4)
     low = jnp.asarray([object_margin, object_margin], dtype=jnp.int32)
     high = jnp.asarray([height - object_margin, width - object_margin], dtype=jnp.int32)
 

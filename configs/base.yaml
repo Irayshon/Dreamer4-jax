@@ -18,6 +18,10 @@ stages:
     lr: 0.0001
     lpips_weight: 0.2
     lpips_frac: 0.25
+    foreground_weight_enabled: true
+    foreground_weight_alpha: 3.0
+    foreground_rgb_tolerance: 0.05
+    foreground_min_patch_ratio: 0.02
     ckpt_save_every: 1000
     ckpt_max_to_keep: 5
     write_image_every: 1000

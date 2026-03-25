@@ -317,3 +317,62 @@ def run_pipeline(
         _run_stage(stage, cfg, current_run_dir, manifest)
 
     return current_run_dir
+
+
+def _parse_ckpt_step(ckpt: str | None) -> int | None:
+    if ckpt is None:
+        return None
+    text = str(ckpt).strip().lower()
+    if text in {"", "latest"}:
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"Invalid ckpt value {ckpt!r}; expected 'latest' or integer step.") from exc
+
+
+def run_visualize(
+    *,
+    run_dir: str | Path,
+    stage: str,
+    ckpt: str | None = "latest",
+) -> dict[str, Any]:
+    """
+    Re-generate stage visualization artifacts from an existing run directory.
+    """
+    current_run_dir = Path(run_dir).resolve()
+    cfg = load_config(current_run_dir / "config_resolved.yaml")
+    env_name = cfg["env_name"]
+    use_wandb = False
+    ckpt_step = _parse_ckpt_step(ckpt)
+
+    if stage == "dynamics":
+        from scripts.train_dynamics import RealismConfig, visualize_from_checkpoint
+
+        stage_cfg = _build_stage_common(cfg["stages"]["dynamics"], current_run_dir, "dynamics", env_name, use_wandb)
+        tok_ckpt = stage_cfg.get("tokenizer_ckpt") or str(current_run_dir / "tokenizer" / "checkpoints")
+        stage_cfg["tokenizer_ckpt"] = _resolve_legacy_checkpoint(tok_ckpt)
+        dyn_cfg = RealismConfig(**_to_dataclass_kwargs(RealismConfig, stage_cfg))
+        return visualize_from_checkpoint(dyn_cfg, ckpt_step=ckpt_step)
+
+    if stage == "bc_rew":
+        from scripts.train_bc_rew_heads import RealismConfig, visualize_from_checkpoint
+
+        stage_cfg = _build_stage_common(cfg["stages"]["bc_rew"], current_run_dir, "bc_rew", env_name, use_wandb)
+        tok_ckpt = stage_cfg.get("tokenizer_ckpt") or str(current_run_dir / "tokenizer" / "checkpoints")
+        dyn_ckpt = stage_cfg.get("pretrained_dyn_ckpt") or str(current_run_dir / "dynamics" / "checkpoints")
+        stage_cfg["tokenizer_ckpt"] = _resolve_legacy_checkpoint(tok_ckpt)
+        stage_cfg["pretrained_dyn_ckpt"] = _resolve_legacy_checkpoint(dyn_ckpt)
+        bc_cfg = RealismConfig(**_to_dataclass_kwargs(RealismConfig, stage_cfg))
+        return visualize_from_checkpoint(bc_cfg, ckpt_step=ckpt_step)
+
+    if stage == "policy":
+        from scripts.train_policy import RLConfig, visualize_from_checkpoint
+
+        stage_cfg = _build_stage_common(cfg["stages"]["policy"], current_run_dir, "policy", env_name, use_wandb)
+        bc_ckpt = stage_cfg.get("bc_rew_ckpt") or str(current_run_dir / "bc_rew" / "checkpoints")
+        stage_cfg["bc_rew_ckpt"] = _resolve_legacy_checkpoint(bc_ckpt)
+        pol_cfg = RLConfig(**_to_dataclass_kwargs(RLConfig, stage_cfg))
+        return visualize_from_checkpoint(pol_cfg, ckpt_step=ckpt_step)
+
+    raise ValueError(f"Unsupported visualize stage {stage!r}; expected one of dynamics/bc_rew/policy.")
