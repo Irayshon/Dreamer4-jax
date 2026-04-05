@@ -1,159 +1,87 @@
-# Core Dreamer4 Mechanisms in JAX for Toy Control and 2.5D Grasping
+# Dreamer4-JAX for 2.5D Visual Grasping (Interview Portfolio Version)
 
-This repository is an unofficial JAX implementation of the core training pipeline introduced in [Dreamer4](https://danijar.com/project/dreamer4/), focused on understanding and validating the method on a small synthetic control problem and then extending it toward a robotics-inspired 2.5D visual grasping benchmark.
+## Project Snapshot
 
-It is best described as:
+This project is an unofficial JAX implementation of core Dreamer4 training mechanisms, extended to a robotics-inspired **2.5D top-down grasping environment**.  
+I completed end-to-end training and evaluation on the `grasping_2p5d` path and organized the pipeline for reproducible multi-stage runs.
 
-- a **core Dreamer4 mechanism reproduction in JAX**
-- a **dual-path research artifact** with a stable toy baseline and an in-progress grasping path
-- a **research portfolio project** for world models and imagination-based RL
+In one line: this is a world-model RL project that goes from visual tokenization to imagination-based policy learning, with concrete grasping results and reproducible artifacts.
 
-It is not a claim of full paper reproduction on Minecraft-scale data, and it should not be described as a real robot manipulation system.
+![Architecture](docs/architecture.png)
 
-![dreamer4](docs/architecture.png)
+## What I Built for 2.5D Grasping
 
-## What This Repo Covers
+- Built and validated the full 4-stage training pipeline on the grasping environment:
+  - tokenizer pretraining
+  - dynamics/world-model training
+  - behavior cloning + reward heads
+  - imagination-based policy optimization
+- Integrated environment-aware routing so the same pipeline supports:
+  - `bouncing_square` (toy baseline for mechanism sanity checks)
+  - `grasping_2p5d` (main interview target)
+- Produced structured run artifacts for reproducibility:
+  - resolved configs
+  - checkpoints per stage
+  - metrics streams
+  - visual diagnostics
+  - final run summaries
 
-The current codebase implements the main Dreamer4-style ingredients:
+## Environment Brief (2.5D Grasping)
 
-- **Causal tokenizer** trained with MAE-style masking and MSE/LPIPS reconstruction
-- **Interactive dynamics model** with shortcut forcing, x-prediction, and ramp loss weighting
-- **Agent/task tokens** plus behavior cloning and reward modeling heads
-- **Imagination training** with TD-lambda returns, PMPO-style policy updates, and KL regularization to a BC prior
-- **Environment-aware training/eval routing** for both the toy and grasping paths
-- **Task-conditioned manipulation batches** for the new goal-conditioned grasping benchmark
+The main environment is implemented in `dreamer/grasping_env.py` and routed through `dreamer/envs.py`.
 
-The repository now has two environment paths:
+- Observation: top-down RGB frames
+- Action space: discrete action vocabulary (`ACTION_DIM = 8`) plus null action handling in pipeline/model wiring
+- Tasks: goal-conditioned setup with `task_ids` (multi-task training and evaluation)
+- Objective signals: grasping and placement oriented rewards with diagnostics exposed in pipeline reporting
 
-- `bouncing_square`: the stable reference baseline used to validate the full 4-stage pipeline
-- `grasping_2p5d`: a robotics-inspired top-down manipulation environment with task IDs and a larger discrete action space
+This design intentionally targets mechanism-level validation for world-model RL in manipulation-like settings, rather than claiming a full real-robot benchmark reproduction.
 
-The grasping path should be presented honestly as an in-progress benchmark extension for mechanism-level evaluation, not as a full manipulation benchmark reproduction.
+## Implementation Flow (Code and Data Path)
 
-## Current Status
-
-What is already in place:
-
-- End-to-end 4-stage training pipeline under `scripts/`
-- Visualizations and example training curves under `docs/`
-- World model, policy, value, and reward heads in pure JAX/Flax
-- JIT-friendly imagination rollout utilities
-- `dreamer/envs.py` environment factory helpers shared across toy and grasping setups
-- `dreamer/grasping_env.py` for deterministic top-down 2.5D grasping demos and evaluation
-
-What is still missing for a paper-level reproduction:
-
-- Large-scale offline video datasets
-- Minecraft-scale experiments
-- Unlabeled-video plus small action-conditioned-data training regime
-- Full paper engineering details such as RoPE, GQA, KV caching, and complete loss RMS normalization
-- Fully validated stronger-environment results beyond the toy baseline
-
-The practical takeaway is: this repo is already a strong starting point for studying Dreamer4-style world models, with a validated toy baseline and a promising grasping extension that is still under active validation.
-
-## Repo Structure
-
-- `dreamer/`
-  - `models.py`: tokenizer, dynamics model, token routing, policy/value/reward heads
-  - `data.py`: bouncing-square dataset and toy environment
-  - `envs.py`: shared environment factory and batch-normalization helpers
-  - `grasping_env.py`: robotics-inspired 2.5D top-down grasping environment
-  - `imagination.py`: latent rollout and denoising schedule utilities
-  - `sampler.py`: sampling helpers and visualization utilities
-  - `utils.py`: checkpointing, state helpers, patchify helpers
-- `scripts/`
-  - `train_tokenizer.py`
-  - `train_dynamics.py`
-  - `train_bc_rew_heads.py`
-  - `train_policy.py`
-  - `eval_bc_rew_heads.py`
-- `docs/`
-  - figures, training curves, paper text extracts, and research-facing docs added in this pass
-
-## Setup
-
-We use `uv` for environment management:
+Unified entrypoint:
 
 ```bash
-uv sync
-uv pip install -e .
+python -m dreamer.pipeline <command> ...
 ```
 
-By default this installs CPU JAX. For GPU, install the appropriate JAX build manually, for example:
+Main commands:
 
-```bash
-uv pip install "jax[cuda12]"
+- `run`: full pipeline (`tokenizer -> dynamics -> bc_rew -> policy -> eval -> report`)
+- `resume`: continue from an interrupted run directory
+- `stage-only`: run a single stage for focused debugging/validation
+
+Configuration source of truth:
+
+- `configs/base.yaml`
+- `configs/profiles/quick_test.yaml`
+- `configs/profiles/production.yaml`
+- `configs/profiles/production_policy_recover.yaml`
+
+Environment/task routing:
+
+- `dreamer/envs.py` selects toy vs grasping specs and batch unpacking behavior
+- `dreamer/grasping_env.py` provides grasping rollout dynamics and task-conditioned batches
+
+Typical artifact layout:
+
+```text
+runs/<experiment_name>/<timestamp>/
+  config_resolved.yaml
+  manifest.json
+  summary.md
+  tokenizer/
+  dynamics/
+  bc_rew/
+  policy/
+  metrics/
 ```
 
-## Run Pipeline
+## Reproducible Training
 
-Use the unified pipeline entrypoint instead of manually editing script `__main__` blocks:
+### Option A: Google Colab (recommended for accessible reproducibility)
 
-```bash
-python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml
-python -m dreamer.pipeline run --config configs/profiles/production.yaml
-python -m dreamer.pipeline run --config configs/profiles/production_policy_recover.yaml
-```
-
-Posthoc visualization (no retraining):
-
-```bash
-python -m dreamer.pipeline visualize --run-dir runs/<experiment>/<timestamp> --stage dynamics --ckpt latest
-python -m dreamer.pipeline visualize --run-dir runs/<experiment>/<timestamp> --stage bc_rew --ckpt latest
-python -m dreamer.pipeline visualize --run-dir runs/<experiment>/<timestamp> --stage policy --ckpt latest
-```
-
-Pipeline stages:
-
-1. `tokenizer`
-2. `dynamics`
-3. `bc_rew`
-4. `policy`
-5. `eval`
-6. `report`
-
-All runs are saved under `runs/<experiment_name>/<timestamp>/` with:
-
-- `config_resolved.yaml`
-- `manifest.json`
-- `summary.md`
-- stage folders with checkpoints/media/`metrics.jsonl`/`curves/*.png`/`best_checkpoint.json`
-- run-level `metrics/dashboard.png` and `metrics/kpi_table.png`
-
-Policy evaluation media and diagnostics:
-
-- `policy/viz/real_env_eval_stepXXXXXX.mp4`
-- `policy/viz/real_env_eval_strip_stepXXXXXX_b*.png`
-- `policy/viz/real_env_eval_manifest_stepXXXXXX.json`
-- `policy/metrics.jsonl` includes grasp diagnostics (`close_count_mean`, `grasp_attempt_count_mean`, `attached_ratio_mean`, etc.)
-
-Dynamics/BC-reward visualization artifacts:
-
-- `dynamics/viz/step_XXXXXX/<tag>_grid.mp4` and `dynamics/viz/step_XXXXXX/eval_manifest.json`
-- `bc_rew/viz/step_XXXXXX/<tag>_grid.mp4` and `bc_rew/viz/step_XXXXXX/eval_manifest.json`
-- if MP4 codec is unavailable, fallback PNG frame folders are written and recorded in the manifest
-
-Tokenizer foreground modeling knobs (`configs/base.yaml -> stages.tokenizer`):
-
-- `foreground_weight_enabled`
-- `foreground_weight_alpha`
-- `foreground_rgb_tolerance`
-- `foreground_min_patch_ratio`
-
-Training logs now include:
-
-- `tokenizer/loss_mse_fg_weighted`
-- `tokenizer/fg_patch_ratio`
-
-## Run on Colab
-
-Recommended runtime:
-
-- GPU runtime enabled
-- High-RAM session when available
-- Persistent Drive mount if you want robust resume across session resets
-
-Minimal setup sequence:
+Setup:
 
 ```bash
 git clone https://github.com/Irayshon/Dreamer4-jax.git
@@ -161,188 +89,104 @@ cd Dreamer4-jax
 pip install uv
 uv sync
 uv pip install -e .
-```
-
-Colab dependency sync (recommended to avoid JAX plugin mismatch):
-
-```bash
 pip uninstall -y jax jaxlib jax-cuda12-plugin jax-cuda12-pjrt
 pip install -r requirements-colab.txt
 ```
 
-Pipeline commands:
+Run:
 
 ```bash
 python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
 python -m dreamer.pipeline run --config configs/profiles/production.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
-python -m dreamer.pipeline run --config configs/profiles/production_policy_recover.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
-python -m dreamer.pipeline visualize --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp> --stage dynamics --ckpt latest
-python -m dreamer.pipeline visualize --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp> --stage bc_rew --ckpt latest
-python -m dreamer.pipeline visualize --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp> --stage policy --ckpt latest
 ```
 
-With `--output-root` pointing to Drive, checkpoint saves are persisted immediately in the mounted directory.
-
-If the session disconnects, resume from an existing run directory:
+Resume:
 
 ```bash
 python -m dreamer.pipeline resume --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp>
 ```
 
-To quickly validate environment/paths without launching full training:
+### Option B: A100 (production-oriented)
 
-```bash
-python -m dreamer.pipeline stage-only --config configs/profiles/quick_test.yaml --stage report
-```
-
-Colab notebook template (cell-by-cell):
-
-```python
-# Cell 1: clone + setup
-!git clone https://github.com/Irayshon/Dreamer4-jax.git
-%cd Dreamer4-jax
-from google.colab import drive
-drive.mount("/content/drive")
-!pip install uv
-!uv sync
-!uv pip install -e .
-!pip uninstall -y jax jaxlib jax-cuda12-plugin jax-cuda12-pjrt
-!pip install -r requirements-colab.txt
-```
-
-```python
-# Cell 2: quick smoke check
-!python -m dreamer.pipeline stage-only --config configs/profiles/quick_test.yaml --stage report
-```
-
-```python
-# Cell 3: quick end-to-end run
-!python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
-```
-
-```python
-# Cell 4: resume an interrupted run
-!python -m dreamer.pipeline resume --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp>
-```
-
-```python
-# Cell 5: production run
-!python -m dreamer.pipeline run --config configs/profiles/production.yaml --output-root /content/drive/MyDrive/Dreamer4Runs
-```
-
-```python
-# Cell 6: posthoc visualization from existing checkpoints
-!python -m dreamer.pipeline visualize --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp> --stage dynamics --ckpt latest
-!python -m dreamer.pipeline visualize --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp> --stage bc_rew --ckpt latest
-!python -m dreamer.pipeline visualize --run-dir /content/drive/MyDrive/Dreamer4Runs/<experiment_name>/<timestamp> --stage policy --ckpt latest
-```
-
-## Run on Local Machine
-
-Minimal local setup:
+Setup:
 
 ```bash
 uv sync
 uv pip install -e .
-uv pip install "jax[cuda12]"
-```
-
-If you hit JAX/plugin mismatch locally, force the pinned set:
-
-```bash
 pip uninstall -y jax jaxlib jax-cuda12-plugin jax-cuda12-pjrt
 pip install -r requirements-local-gpu.txt
 ```
 
-Recommended workflow:
+Run production profile:
 
 ```bash
-python -m dreamer.pipeline run --config configs/profiles/quick_test.yaml
 python -m dreamer.pipeline run --config configs/profiles/production.yaml
 ```
 
-Common troubleshooting:
+Policy recovery/extension run:
 
-- CUDA/JAX mismatch: reinstall JAX with the CUDA build matching your driver/toolkit.
-- GPU not detected: verify `jax.devices()` includes a CUDA device.
-- Missing `jaxlpips`: run `pip install jaxlpips` or install from `requirements-colab.txt` / `requirements-local-gpu.txt`.
-- OOM: reduce `B`, `T`, or `horizon` in profile YAML (prefer reducing `B` first).
-- `make_iterator() missing ... channels` or tuple-unpack mismatches: use `python -m dreamer.pipeline visualize ...` instead of old ad-hoc eval scripts; pipeline path uses current `dreamer.envs.make_iterator` + `unpack_batch`.
-- `Dynamics.__init__() got unexpected keyword argument 'action_dim'`: do not instantiate `Dynamics` manually with stale kwargs; current code uses `n_actions=action_dim+1`.
-- Orbax shape mismatch (for example `Requested shape ... stored shape ...`): run posthoc visualization from the original run directory so stage metadata (`meta.cfg`) drives the restore shape.
+```bash
+python -m dreamer.pipeline run --config configs/profiles/production_policy_recover.yaml
+```
 
-## Estimated Runtime by GPU
+Resume from checkpointed run:
 
-Assumptions for estimates:
+```bash
+python -m dreamer.pipeline resume --run-dir runs/<experiment_name>/<timestamp>
+```
 
-- single GPU
-- default `quick_test` and `production` profiles
-- no major I/O bottleneck
-- no repeated restarts
+### A100 Runtime Note
 
-Stage share guidance for debugging bottlenecks:
+For a single A100 (40GB class), end-to-end production runs are expected on the order of multiple days (roughly ~2.5 to 4.5 days depending on system load and I/O), while `quick_test` is typically a few hours.
 
-- tokenizer: 15-20%
-- dynamics: 25-30%
-- bc_rew: 20-25%
-- policy: 30-40%
+## Results (`docs/results`)
 
-Estimated end-to-end wall-time (tokenizer + dynamics + bc_rew + policy + eval/report):
+All curated outputs used for this interview version are in `docs/results`.
 
-| GPU | quick_test | production |
-|---|---:|---:|
-| Colab T4 (16GB) | 6-12h | 10-18d |
-| Colab L4 (24GB) | 3-6h | 5-9d |
-| Colab A100 (40GB) | 1.5-3h | 2.5-4.5d |
-| RTX 3060 (12GB) | 7-14h | Not recommended at default config (downscale needed) |
-| RTX 3090 (24GB) | 2.5-5h | 4-7d |
-| RTX 4090 (24GB) | 2-4h | 3.5-6d |
+### 1) Tokenizer Quality (visual reconstruction sanity)
 
-## Cost/Time Notes
+![Tokenizer Reconstruction](docs/results/tokenizer-step_070000.png)
 
-- These are end-to-end wall-time ranges, not strict SLA numbers.
-- Actual runtime can vary with driver/JAX version, logging/media I/O, and background load.
-- `production` on Colab typically spans multiple sessions; use `resume` as the default workflow.
-- 12GB-class GPUs may require reduced batch/time settings for `production`.
+What it shows: the tokenizer is learning meaningful visual structure instead of collapsing to trivial outputs.
 
-Primary docs:
+### 2) End-to-End Training Curves
 
-- [Architecture](docs/architecture.md)
-- [Pipeline](docs/pipeline.md)
-- [Experiments](docs/experiments.md)
-- [Reproduction Audit](docs/reproduction_audit.md)
+![Total Training Curve](docs/results/total_curve.png)
 
-## Expected Acceptance Signals
+What it shows: stage-level training signals are stable enough to support full-pipeline optimization.
 
-The current acceptance signals are split by path:
+### 3) Real Environment Evaluation Strips (policy behavior snapshots)
 
-- Toy path:
-  - Tokenizer: good masked reconstruction and strong PSNR
-  - Dynamics: accurate autoregressive rollouts and stable shortcut sampling
-  - BC/Reward stage: decreasing action/reward losses and sensible readouts
-  - Policy stage: improved imagined return and real toy-environment return
+![Policy Eval Strip Step 20000](docs/results/policy_real_env_eval_strip_step020000_b1.png)
+![Policy Eval Strip Step 40000](docs/results/policy_real_env_eval_strip_step040000_b2.png)
 
-- Grasping path:
-  - End-to-end batch compatibility through all 4 training stages
-  - Correct action-vocabulary and `task_ids` wiring
-  - Coherent visual predictions across approach / grasp / transport / place phases
-  - Interpretable grasp metrics such as grasp success and placement success
+What it shows: qualitative progression of grasping behavior under real-environment evaluation rollouts.
 
-Representative outputs already checked into `docs/`:
+### 4) Video Artifacts
 
-- tokenizer reconstruction snapshot: `docs/step_75900.png`
-- dynamics curves: `docs/dynamics_training.png`
-- BC/reward curves: `docs/bc_rew_training.png`
-- policy curves: `docs/rl_training.png`
-- imagination/video demos: `docs/imagination-cropped.gif`, `docs/rl-cropped.gif`
+- [Policy training video](docs/results/policy_training.mp4)  
+  Shows policy-stage behavior evolution over training.
+- [BC/Reward + shortcut AR grid](docs/results/bc_reward_shortcut_d4_pure_AR_grid.mp4)  
+  Shows dynamics/behavior modeling quality in autoregressive shortcut evaluation grids.
 
-## Honest Positioning
+## Interview Talking Points
 
-If you use this repo in applications, the safest framing is:
+### Technical Highlights
 
-> Implemented and analyzed the core Dreamer4 training pipeline in JAX, validated on a toy visual-control domain and extended toward a robotics-inspired 2.5D grasping benchmark, including MAE tokenizer pretraining, shortcut-forcing dynamics, BC/reward finetuning, and imagination-based RL with PMPO-style updates.
+- Implemented a full world-model RL pipeline in JAX/Flax, not only a single training script.
+- Combined causal visual tokenization, latent dynamics learning, BC/reward supervision, and imagination-based policy updates in one reproducible workflow.
+- Supported task-conditioned manipulation with `task_ids` and environment-aware data routing.
 
-That framing is both strong and accurate.
+### Engineering Highlights
+
+- Pipeline-first execution model (`dreamer.pipeline`) with `run/resume/stage-only`.
+- Structured, inspectable run artifacts for reproducibility and debugging.
+- Profile-driven experiments (`quick_test`, `production`, `production_policy_recover`) to separate fast iteration from long-horizon training.
+
+### Honest Scope Boundary
+
+This repository demonstrates **core Dreamer4-style mechanisms in a toy + 2.5D grasping setting**.  
+It does **not** claim a full paper-scale reproduction (for example, Minecraft-scale data/training regime).
 
 ## References
 
